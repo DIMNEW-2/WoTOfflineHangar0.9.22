@@ -19,9 +19,16 @@ import random
 
 _LOG_PREFIX = '[OFFLINE-NY] '
 
-# Festive hangar space fallback name; the actual space is probed in res
-# (0.9.22 clients ship it as 'h07_newyear_2018' and/or 'h07_newyear_2015').
+# Festive hangar space fallback name; the actual space is probed in res.
+# Known names: 'h07_newyear_2018'/'h07_newyear_2015' (EU/RU clients) and
+# 'hangar_ny_cn'/'hangar_ny_cn_hd' (Chinese clients ship the NY hangars in
+# packages/hangar_ny_cn.pkg and packages/hangar_ny_cn_hd.pkg).
 NY_HANGAR_PATH = 'h07_newyear_2015'
+NY_SPACE_CANDIDATES = ('spaces/h07_newyear_2018',
+ 'spaces/hangar_ny_cn_hd',
+ 'spaces/hangar_ny_cn',
+ 'spaces/h07_newyear_2015')
+_NY_SPACE_NAME_TOKENS = ('newyear', 'new_year', 'christmas', '_ny', 'ny_', 'ny_cn')
 
 # Starting kit: no battles are available offline, so the event currency and a
 # stock of gift boxes are granted on the first entry into the hangar.
@@ -721,7 +728,6 @@ def _patchToyCache():
 # as 'h07_newyear_2018' and/or 'h07_newyear_2015').
 # ---------------------------------------------------------------------------
 
-NY_SPACE_CANDIDATES = ('spaces/h07_newyear_2018', 'spaces/h07_newyear_2015')
 _NY_SPACE_RESOLVED = [None]
 
 
@@ -738,7 +744,7 @@ def _resolveNYSpace():
             for folderName, _ds in root.items():
                 scanned.append(str(folderName))
                 low = str(folderName).lower()
-                if ('newyear' in low or 'new_year' in low) and 'spaces/' + str(folderName) not in candidates:
+                if any(tok in low for tok in _NY_SPACE_NAME_TOKENS) and 'spaces/' + str(folderName) not in candidates:
                     candidates.append('spaces/' + str(folderName))
     except Exception as e:
         _warn('spaces folder scan failed: %s' % e)
@@ -755,7 +761,7 @@ def _resolveNYSpace():
     except Exception as e:
         _warn('NY space probe failed: %s' % e)
     _NY_SPACE_RESOLVED[0] = 'spaces/' + NY_HANGAR_PATH
-    _warn('NY hangar space not found in res (tried: %s); falling back to %s' % (', '.join(candidates), _NY_SPACE_RESOLVED[0]))
+    _warn('NY hangar space not found in res (tried: %s; spaces folder: %s); falling back to %s' % (', '.join(candidates), ', '.join(scanned) or '?', _NY_SPACE_RESOLVED[0]))
     return _NY_SPACE_RESOLVED[0]
 
 
@@ -1079,6 +1085,31 @@ def handleCommand(p, doCmdMethod, cmd, args):
 # account patches: showGUI seeding and the __doCmd dispatcher
 # ---------------------------------------------------------------------------
 
+def _patchNyLocEnums():
+    """The vanilla locale enums miss the ny18Toys keys (WG's own gap in the
+    generated enums), so reward tooltips warn 'Localization key not found'.
+    Extend the enum tuples with the ny18Toys keys - the membership check then
+    passes and the event localization text (shipped in the client) is used."""
+    try:
+        from gui.Scaleform.locale import QUESTS as _locQ, TOOLTIPS as _locT
+        _patched = []
+        if '#quests:bonusName/ny18Toys' not in _locQ.BONUSNAME_ENUM:
+            _locQ.BONUSNAME_ENUM = tuple(_locQ.BONUSNAME_ENUM) + ('#quests:bonusName/ny18Toys',)
+            _patched.append('quests.bonusName')
+        if '#tooltips:awardItem/ny18Toys/header' not in _locT.AWARDITEM_ALL_HEADER_ENUM:
+            _locT.AWARDITEM_ALL_HEADER_ENUM = tuple(_locT.AWARDITEM_ALL_HEADER_ENUM) + ('#tooltips:awardItem/ny18Toys/header',)
+            _patched.append('tooltips.header')
+        if '#tooltips:awardItem/ny18Toys/body' not in _locT.AWARDITEM_ALL_BODY_ENUM:
+            _locT.AWARDITEM_ALL_BODY_ENUM = tuple(_locT.AWARDITEM_ALL_BODY_ENUM) + ('#tooltips:awardItem/ny18Toys/body',)
+            _patched.append('tooltips.body')
+        if _patched:
+            _log('locale enums extended for ny18Toys: %s' % ', '.join(_patched))
+        return True
+    except Exception as e:
+        _warn('locale enum patch failed: %s' % e)
+        return False
+
+
 def _seedEvent():
     """Initial event state: IN_PROGRESS + starter resources (no battles offline)."""
     if _State.seeded:
@@ -1200,6 +1231,10 @@ def init():
         _patchShopGoodies()
     except Exception as e:
         _warn('shop goodies: %s' % e)
+    try:
+        _patchNyLocEnums()
+    except Exception as e:
+        _warn('locale enums: %s' % e)
     try:
         _patchHangarSwitch()
     except Exception as e:
