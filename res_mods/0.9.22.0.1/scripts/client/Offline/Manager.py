@@ -912,9 +912,9 @@ def init_offline():
                             [
                              999999999], [999999999]), 
                'dailyPlayHours': [
-                                3, 
-                                3, 3, 3, 3, 
-                                3, 3, 3], 
+                                0, 
+                                0, 0, 0, 0, 
+                                0, 0, 0], 
                'globalVehicleLocks': {}, 'freeVehiclesLeft': 0, 
                'vehicleSellsLeft': 999999, 
                'freeTMenLeft': 0, 
@@ -2505,12 +2505,12 @@ def _apply_surgical_fixes():
                 if slotType in _amp_mod.ARTEFACTS_SLOTS:
                     for slotId in xrange(_NODS):
                         devices.append(VoClass(slotItems, vehicle, slotType, slotId, _TTC.HANGAR_MODULE))
-
-                elif slotType in _amp_mod._BOOSTERS_SLOTS:
+                    continue
+                if slotType in _amp_mod._BOOSTERS_SLOTS:
                     for slotId in xrange(_BBLS):
                         devices.append(VoClass(slotItems, vehicle, slotType, slotId, tooltipType=_TTC.BATTLE_BOOSTER))
-
-                elif not slotItems and slotType in _MODULE_ATTR_BY_SLOT_TYPE:
+                    continue
+                if not slotItems and slotType in _MODULE_ATTR_BY_SLOT_TYPE:
                     try:
                         installedCD = getattr(vehicle, _MODULE_ATTR_BY_SLOT_TYPE[slotType]).intCD
                         installedItem = itemsCache.items.getItemByCD(installedCD)

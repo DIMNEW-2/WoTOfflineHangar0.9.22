@@ -345,10 +345,15 @@ def _installEventsData():
     """Puts NY state + hidden quests into account eventsData and notifies."""
     import cPickle
     import zlib
-    from constants import EVENT_CLIENT_DATA, NY_STATE
+    from constants import EVENT_CLIENT_DATA
+    try:
+        from items.new_year_types import NY_STATE
+        nyState = NY_STATE.IN_PROGRESS
+    except Exception:
+        nyState = 1  # NY_STATE.IN_PROGRESS
     p = _player()
     ed = p.eventsData
-    ed[EVENT_CLIENT_DATA.INGAME_EVENTS] = zlib.compress(cPickle.dumps({'newYearEvent': {'state': NY_STATE.IN_PROGRESS}}))
+    ed[EVENT_CLIENT_DATA.INGAME_EVENTS] = zlib.compress(cPickle.dumps({'newYearEvent': {'state': nyState}}))
     ed[EVENT_CLIENT_DATA.INGAME_EVENTS_REV] = 1
     ed[EVENT_CLIENT_DATA.QUEST] = zlib.compress(cPickle.dumps(_hiddenQuestsData()))
     ed[EVENT_CLIENT_DATA.QUEST_REV] = 1
@@ -476,7 +481,11 @@ def _patchShopGoodies():
     """Serves NY discount descriptions from the local shop when the server data has none."""
     global _NY_GOODIES
     try:
-        from gui.shared.utils.requesters import ShopRequester as _SR
+        import sys as _sys
+        import gui.shared.utils.requesters  # noqa: F401 - ensure package is imported
+        _SR = _sys.modules.get('gui.shared.utils.requesters.ShopRequester')
+        if _SR is None:
+            _SR = __import__('gui.shared.utils.requesters.ShopRequester', fromlist=['ShopCommonStats'])
     except Exception as e:
         _warn('ShopRequester patch failed: %s' % e)
         return
@@ -498,10 +507,16 @@ def _patchShopGoodies():
          'prices': {},
          'notInShop': set()}
 
-    _SR.ShopCommonStats.getGoodiesData = _goodiesData
-    _SR.ShopRequester.getGoodiesData = _goodiesData
-    _SR.DefaultShopRequester.getGoodiesData = _goodiesData
-    _log('shop goodies patched OK')
+    patched = []
+    for clsName in ('ShopCommonStats', 'ShopRequester', 'DefaultShopRequester'):
+        cls = getattr(_SR, clsName, None)
+        if cls is not None and hasattr(cls, 'getGoodiesData'):
+            cls.getGoodiesData = _goodiesData
+            patched.append(clsName)
+    if patched:
+        _log('shop goodies patched OK (%s)' % ', '.join(patched))
+    else:
+        _warn('shop goodies: no ShopCommonStats classes found')
 
 
 def _grantGoodie(goodieID):
@@ -986,18 +1001,29 @@ def _seedEvent():
         if p is None or getattr(p, 'newYear', None) is None:
             return
         _State.seeded = True
-        _installEventsData()
-        # starter kit
-        _setFragments(STARTER_FRAGMENTS)
-        _seedTankmanChoices()
-        _addTokens(dict(((t, n) for t, n in STARTER_BOXES.iteritems())))
-        _State.maxReachedLevel = 0
-        _updateLevelRewards()
-        _log('event seeded: state=IN_PROGRESS fragments=%d boxes=%d' % (STARTER_FRAGMENTS, sum(STARTER_BOXES.values())))
     except Exception as e:
         _warn('event seeding failed: %s' % e)
-        import traceback
-        traceback.print_exc()
+        return
+
+    def step(name, fn):
+        try:
+            fn()
+        except Exception as e:
+            _warn('seed step %s failed: %s' % (name, e))
+            import traceback
+            traceback.print_exc()
+
+    step('eventsData', _installEventsData)
+    step('fragments', (lambda : _setFragments(STARTER_FRAGMENTS)))
+    step('tankmanChoices', _seedTankmanChoices)
+    step('boxes', (lambda : _addTokens(dict(((t, n) for t, n in STARTER_BOXES.iteritems())))))
+
+    def _levels():
+        _State.maxReachedLevel = 0
+        _updateLevelRewards()
+
+    step('levelRewards', _levels)
+    _log('event seeded: state=IN_PROGRESS fragments=%d boxes=%d' % (STARTER_FRAGMENTS, sum(STARTER_BOXES.values())))
 
 
 def _patchAccount():
