@@ -7,7 +7,24 @@ The code below represents a standard Offline Hangar modification for the game ve
 
 ![Описание изображения](shot_014.jpg)
 
-Requires [Python 2.6.6 x32](https://www.python.org/downloads/release/python-266/) to be compiled and used in the game or extract two files from [this archive](https://k2mg.net/res/storage/python26.7z) into your PjOrion folder and change your Python library to python26.dll via Terminal -> Settings -> Basic setup.
+The package ships as readable Python sources (`*.py`) plus ready-to-use compiled modules (`*.pyc`, Python 2.7 bytecode, magic 62211). To rebuild the `.pyc` files yourself, use any [Python 2.7](https://www.python.org/downloads/release/python-2718/) (`python -m py_compile <file>`); to run inside the game you can also extract two files from [this archive](https://k2mg.net/res/storage/python26.7z) into your PjOrion folder and change your Python library to python27.dll via Terminal -> Settings -> Basic setup.
+________________________________________
+[RU] Новогодний ивент «Новогоднее наступление»
+
+В состав мода входит полное оффлайн-восстановление новогоднего ивента «Новогоднее наступление» (NY 2018, токены `ny18:*`) из патча 0.9.22 — без боёв и без обращения к серверу:
+- новогодняя сцена-ангар (`h07_newyear_2015`) с ёлкой, снеговиком, домом и гирляндами;
+- размещение игрушек на слотах, фильтры, пометка «новых», коллекции 4 стилей;
+- крафт игрушек за «хлопушки» и разбор игрушек на фрагменты;
+- подарочные коробки (все 9 видов, включая «подарки от друзей») с анимацией открытия и лентой наград;
+- 10 уровней атмосферы, сундуки уровня, экран наград;
+- персональные скидки на танки (goodies 12000–12899) и найм девушек-танкисток (включая выбор имени/иконки);
+- награды за коллекции (`ny18:cr:*`).
+
+Реализация — `res_mods/0.9.22.0.1/scripts/client/Offline/NewYearEvent.py`: локальная (клиентская) обработка команд `CMD_NEW_YEAR_*` в том же контракте callback'ов, что и у настоящего сервера (включая 4-аргументный `onCmdResponseExt` c `ext`-данными). Состояние события хранится в штатном `ClientNewYear` аккаунта и передаётся через его `synchronize()`; скрытые квесты коробок/сундуков/коллекций лежат в `eventsData[EVENT_CLIENT_DATA.QUEST]`. Бои не требуются: при первом входе в ангар выдаётся стартовый набор (1000 фрагментов + коробки), а новые коробки/скидки/танкистки приходят за уровни атмосферы. Модуль подключается автоматически через `Offline/__init__.py`.
+
+[EN] New Year event «Новогоднее наступление» (offline restoration)
+
+The mod includes a complete offline restoration of the 0.9.22 New Year event (NY 2018, `ny18:*` tokens) — no battles and no server contact required: the festive hangar scene, toy placement/crafting/recycling, all 9 gift box types with the opening animation and reward ribbon, 10 atmosphere levels with level chests and the awards screen, personal vehicle discounts and tankwoman recruiting, and collection rewards. It is implemented in `Offline/NewYearEvent.py` as local (client-side) handling of the `CMD_NEW_YEAR_*` commands with the exact callback contract of the vanilla client (including the 4-argument `onCmdResponseExt` with unpickled `ext` data). Event state lives in the account's own `ClientNewYear` cache and is pushed through its `synchronize()`; hidden quests for boxes/chests/collections are stored in `eventsData[EVENT_CLIENT_DATA.QUEST]`. Since battles are not available offline, a starter kit (1000 craft fragments + gift boxes) is granted on first entry into the hangar. The module is mounted automatically via `Offline/__init__.py`.
 ________________________________________
 [RU] Отказ от ответственности
 
