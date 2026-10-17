@@ -19,7 +19,8 @@ import random
 
 _LOG_PREFIX = '[OFFLINE-NY] '
 
-# 'h07_newyear_2015' - the festive hangar space of the 0.9.22 New Year event.
+# Festive hangar space fallback name; the actual space is probed in res
+# (0.9.22 clients ship it as 'h07_newyear_2018' and/or 'h07_newyear_2015').
 NY_HANGAR_PATH = 'h07_newyear_2015'
 
 # Starting kit: no battles are available offline, so the event currency and a
@@ -712,32 +713,118 @@ def _patchToyCache():
 
 # ---------------------------------------------------------------------------
 # New Year hangar scene switching (restores NewYearController.__switchHangar)
+#
+# In the vanilla client the festive space is activated by server event
+# notifications (_EVENT_HANGAR_PATHS via g_clientHangarSpaceOverride); the
+# local __switchHangar is a stub.  Offline we drive the same override
+# directly, and probe res for the actual space name (0.9.22 clients ship it
+# as 'h07_newyear_2018' and/or 'h07_newyear_2015').
 # ---------------------------------------------------------------------------
+
+NY_SPACE_CANDIDATES = ('spaces/h07_newyear_2018', 'spaces/h07_newyear_2015')
+_NY_SPACE_RESOLVED = [None]
+
+
+def _resolveNYSpace():
+    """Returns the festive hangar space path present in this client's res."""
+    if _NY_SPACE_RESOLVED[0]:
+        return _NY_SPACE_RESOLVED[0]
+    candidates = list(NY_SPACE_CANDIDATES)
+    scanned = []
+    try:
+        import ResMgr
+        root = ResMgr.openSection('spaces')
+        if root is not None:
+            for folderName, _ds in root.items():
+                scanned.append(str(folderName))
+                low = str(folderName).lower()
+                if ('newyear' in low or 'new_year' in low) and 'spaces/' + str(folderName) not in candidates:
+                    candidates.append('spaces/' + str(folderName))
+    except Exception as e:
+        _warn('spaces folder scan failed: %s' % e)
+    try:
+        import ResMgr
+        for cand in candidates:
+            try:
+                if ResMgr.openSection(cand) is not None:
+                    _NY_SPACE_RESOLVED[0] = cand
+                    _log('NY hangar space selected: %s (spaces folder: %s)' % (cand, ', '.join(scanned) or '?'))
+                    return cand
+            except Exception:
+                continue
+    except Exception as e:
+        _warn('NY space probe failed: %s' % e)
+    _NY_SPACE_RESOLVED[0] = 'spaces/' + NY_HANGAR_PATH
+    _warn('NY hangar space not found in res (tried: %s); falling back to %s' % (', '.join(candidates), _NY_SPACE_RESOLVED[0]))
+    return _NY_SPACE_RESOLVED[0]
+
+
+def _applyNYHangarPath(defaultHangar, reloadSpace=True):
+    """Sets (or clears) the event hangar override used by ClientHangarSpace.create."""
+    try:
+        from gui.ClientHangarSpace import g_clientHangarSpaceOverride
+        if defaultHangar:
+            g_clientHangarSpaceOverride.setPath(None, False, False)
+            g_clientHangarSpaceOverride.setPath(None, True, False)
+        else:
+            path = _resolveNYSpace()
+            g_clientHangarSpaceOverride.setPath(path, False, False)
+            g_clientHangarSpaceOverride.setPath(path, True, False)
+        if reloadSpace:
+            try:
+                from gui.shared.utils.HangarSpace import g_hangarSpace
+                if getattr(g_hangarSpace, 'inited', False):
+                    g_hangarSpace.refreshSpace(g_hangarSpace.isPremium, True)
+            except Exception:
+                pass
+    except Exception as e:
+        _warn('hangar path apply failed: %s' % e)
+
+
+def _applyHangarForCurrentState():
+    """Chooses festive/default hangar from the current NY state."""
+    try:
+        import BigWorld
+        p = BigWorld.player()
+        cny = getattr(p, 'newYear', None) if p is not None else None
+        state = getattr(cny, 'state', None) if cny is not None else None
+    except Exception:
+        state = None
+    if state is None:
+        state = 1 if _State.seeded else 0
+    _applyNYHangarPath(state != 1, True)
+
 
 def _patchHangarSwitch():
     try:
         from new_year.new_year_controller import NewYearController
-        from gui.ClientHangarSpace import g_clientHangarSpaceOverride
+        import BigWorld
 
         def _switchHangar(self, defaultHangar):
-            try:
-                if defaultHangar:
-                    g_clientHangarSpaceOverride.setPath(None, False, False)
-                    g_clientHangarSpaceOverride.setPath(None, True, False)
-                else:
-                    g_clientHangarSpaceOverride.setPath(NY_HANGAR_PATH, False, False)
-                    g_clientHangarSpaceOverride.setPath(NY_HANGAR_PATH, True, False)
-                try:
-                    from gui.shared.utils.HangarSpace import g_hangarSpace
-                    if getattr(g_hangarSpace, 'inited', False):
-                        g_hangarSpace.refreshSpace(g_hangarSpace.isPremium, True)
-                except Exception:
-                    pass
-            except Exception as e:
-                _warn('hangar switch failed: %s' % e)
+            _applyNYHangarPath(bool(defaultHangar), True)
 
         NewYearController._NewYearController__switchHangar = _switchHangar
         _log('NewYearController.__switchHangar restored')
+
+        # Belt and braces: _updateState's chain can fail before __switchHangar
+        # runs - force the right space right after lobby start regardless.
+        if not getattr(NewYearController, '_nyLobbyStartedWrapped', False):
+            _origLobbyStarted = NewYearController.onLobbyStarted
+
+            def _onLobbyStarted(self, ctx):
+                try:
+                    _origLobbyStarted(self, ctx)
+                except Exception as e:
+                    _warn('NewYearController.onLobbyStarted failed: %s' % e)
+                    import traceback
+                    traceback.print_exc()
+                _applyHangarForCurrentState()
+                return
+
+            NewYearController.onLobbyStarted = _onLobbyStarted
+            NewYearController._nyLobbyStartedWrapped = True
+            _log('NewYearController.onLobbyStarted wrapped (hangar force)')
+        _applyNYHangarPath(False, False)
     except Exception as e:
         _warn('hangar switch patch failed: %s' % e)
 
@@ -1023,6 +1110,7 @@ def _seedEvent():
         _updateLevelRewards()
 
     step('levelRewards', _levels)
+    step('hangar', _applyHangarForCurrentState)
     _log('event seeded: state=IN_PROGRESS fragments=%d boxes=%d' % (STARTER_FRAGMENTS, sum(STARTER_BOXES.values())))
 
 
@@ -1041,6 +1129,10 @@ def _patchAccount():
                 _seedEvent()
             except Exception as e:
                 _warn('seed before showGUI failed: %s' % e)
+            try:
+                _applyHangarForCurrentState()
+            except Exception as e:
+                _warn('hangar apply before showGUI failed: %s' % e)
             return _orig_showGUI(self, ctx)
 
         _Acct.PlayerAccount.showGUI = _showGUI
