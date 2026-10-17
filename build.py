@@ -1,0 +1,67 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Builds the WoT 0.9.21.0.1 Offline Hangar mod: compiles the Python 2.7
+sources in src/ to .pyc files in res_mods/0.9.21.0.1/ (same layout as the
+original 0.9.22 mod shipped).
+
+Requires a Python 2.7 interpreter. Point WOT_PY27 at it if it is not found
+automatically:
+    WOT_PY27=/path/to/python2.7 python3 build.py
+"""
+import os
+import shutil
+import subprocess
+import sys
+
+TARGET_VERSION = '0.9.21.0.1'
+ROOT = os.path.dirname(os.path.abspath(__file__))
+SRC = os.path.join(ROOT, 'src')
+DST = os.path.join(ROOT, 'res_mods', TARGET_VERSION, 'scripts', 'client')
+
+FILES = [
+    'Offline/__init__.py',
+    'Offline/Manager.py',
+    'Offline/NewYearServer.py',
+    'gui/Scaleform/daapi/view/login/LoginView.py',
+]
+
+_COMPILE_SNIPPET = (
+    "import py_compile, sys\n"
+    "py_compile.compile(sys.argv[1], cfile=sys.argv[2], doraise=True)\n"
+    "print('compiled: ' + sys.argv[2])\n"
+)
+
+
+def find_python27():
+    candidates = [os.environ.get('WOT_PY27'), '/tmp/py27/bin/python',
+                  shutil.which('python2.7'), shutil.which('python2')]
+    for cand in candidates:
+        if cand and os.path.isfile(cand):
+            out = subprocess.run([cand, '-c', 'import sys; print(sys.version_info[:2])'],
+                                 capture_output=True, text=True)
+            if '(2, 7)' in out.stdout:
+                return cand
+    return None
+
+
+def main():
+    py27 = find_python27()
+    if not py27:
+        sys.exit('ERROR: Python 2.7 interpreter not found. '
+                 'Set WOT_PY27=/path/to/python2.7')
+    print('Using Python 2.7: %s' % py27)
+    for rel in FILES:
+        src = os.path.join(SRC, rel)
+        dst = os.path.join(DST, rel[:-3] + '.pyc')  # .py -> .pyc
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        subprocess.run([py27, '-c', _COMPILE_SNIPPET, src, dst], check=True)
+        with open(dst, 'rb') as f:
+            magic = f.read(4)
+        if magic != b'\x03\xf3\r\n':
+            sys.exit('ERROR: unexpected .pyc magic in %s: %r' % (dst, magic))
+    print('Done. Install: copy res_mods/%s/ into your World of Tanks folder.' % TARGET_VERSION)
+
+
+if __name__ == '__main__':
+    main()

@@ -1,0 +1,3 @@
+src/**/*.pyc
+tools/**/*.pyc
+__pycache__/
