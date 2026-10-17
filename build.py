@@ -14,10 +14,11 @@ import shutil
 import subprocess
 import sys
 
-TARGET_VERSION = '0.9.21.0.1'
+# The 0.9.21 micropatches share the same scripts; only the res_mods
+# folder name differs (.0.1 vs .0.2 clients), so build both.
+TARGET_VERSIONS = ['0.9.21.0.1', '0.9.21.0.2']
 ROOT = os.path.dirname(os.path.abspath(__file__))
 SRC = os.path.join(ROOT, 'src')
-DST = os.path.join(ROOT, 'res_mods', TARGET_VERSION, 'scripts', 'client')
 
 FILES = [
     'Offline/__init__.py',
@@ -51,16 +52,19 @@ def main():
         sys.exit('ERROR: Python 2.7 interpreter not found. '
                  'Set WOT_PY27=/path/to/python2.7')
     print('Using Python 2.7: %s' % py27)
-    for rel in FILES:
-        src = os.path.join(SRC, rel)
-        dst = os.path.join(DST, rel[:-3] + '.pyc')  # .py -> .pyc
-        os.makedirs(os.path.dirname(dst), exist_ok=True)
-        subprocess.run([py27, '-c', _COMPILE_SNIPPET, src, dst], check=True)
-        with open(dst, 'rb') as f:
-            magic = f.read(4)
-        if magic != b'\x03\xf3\r\n':
-            sys.exit('ERROR: unexpected .pyc magic in %s: %r' % (dst, magic))
-    print('Done. Install: copy res_mods/%s/ into your World of Tanks folder.' % TARGET_VERSION)
+    for version in TARGET_VERSIONS:
+        dst_root = os.path.join(ROOT, 'res_mods', version, 'scripts', 'client')
+        for rel in FILES:
+            src = os.path.join(SRC, rel)
+            dst = os.path.join(dst_root, rel[:-3] + '.pyc')  # .py -> .pyc
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            subprocess.run([py27, '-c', _COMPILE_SNIPPET, src, dst], check=True)
+            with open(dst, 'rb') as f:
+                magic = f.read(4)
+            if magic != b'\x03\xf3\r\n':
+                sys.exit('ERROR: unexpected .pyc magic in %s: %r' % (dst, magic))
+    print('Done. Install: copy the res_mods/<your client micropatch>/ '
+          'folder (%s) into your World of Tanks folder.' % ' or '.join(TARGET_VERSIONS))
 
 
 if __name__ == '__main__':

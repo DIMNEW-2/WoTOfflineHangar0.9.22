@@ -2840,6 +2840,21 @@ def _apply_surgical_fixes():
             VoClass = VoClass or _FSVO
             itemTypeIDs = [_GTI[slotType] for slotType in slotsRange]
             gatheredItems = itemsCache.items.getItemsEx(itemTypeIDs, _RC.CUSTOM((lambda item: item.isInstalled(vehicle))), vehicle.nationID)
+
+            def _empty_module_vo(slotType):
+                # 0.9.21 FittingSlotVO._prepareModule() unconditionally does
+                # modulesData[0] when slotId is None, so an empty module
+                # slot must not go through VoClass; emit the same dict the
+                # VO produces for "no module" instead.
+                return {'id': -1,
+                 'tooltip': '',
+                 'tooltipType': _TTC.COMPLEX,
+                 'slotType': slotType,
+                 'removable': True,
+                 'slotIndex': 0,
+                 'level': 0,
+                 'moduleLabel': 'empty'}
+
             for slotType in slotsRange:
                 slotTypeIdx = _GTI[slotType]
                 slotItems = [item for item in gatheredItems.itervalues() if item.itemTypeID == slotTypeIdx]
@@ -2851,17 +2866,21 @@ def _apply_surgical_fixes():
                     for slotId in xrange(_BBLS):
                         devices.append(VoClass(slotItems, vehicle, slotType, slotId, tooltipType=_TTC.BATTLE_BOOSTER))
 
-                elif not slotItems and slotType in _MODULE_ATTR_BY_SLOT_TYPE:
-                    try:
-                        installedCD = getattr(vehicle, _MODULE_ATTR_BY_SLOT_TYPE[slotType]).intCD
-                        installedItem = itemsCache.items.getItemByCD(installedCD)
-                        if installedItem is not None:
-                            slotItems = [
-                             installedItem]
-                    except Exception as _mfe:
-                        print '[OFFLINE] getFittingSlotsData fallback failed for %s: %s' % (slotType, _mfe)
+                else:
+                    if not slotItems and slotType in _MODULE_ATTR_BY_SLOT_TYPE:
+                        try:
+                            installedCD = getattr(vehicle, _MODULE_ATTR_BY_SLOT_TYPE[slotType]).intCD
+                            installedItem = itemsCache.items.getItemByCD(installedCD)
+                            if installedItem is not None:
+                                slotItems = [
+                                 installedItem]
+                        except Exception as _mfe:
+                            print '[OFFLINE] getFittingSlotsData fallback failed for %s: %s' % (slotType, _mfe)
 
-                devices.append(VoClass(slotItems, vehicle, slotType, tooltipType=_TTC.HANGAR_MODULE))
+                    if slotItems:
+                        devices.append(VoClass(slotItems, vehicle, slotType, tooltipType=_TTC.HANGAR_MODULE))
+                    else:
+                        devices.append(_empty_module_vo(slotType))
 
             return devices
 

@@ -452,5 +452,92 @@ rep("""                        BigWorld.callback(0.5, _initial_stats_resync)""",
                         BigWorld.callback(1.0, (lambda _oid=off_stats.get('currentVehInvID', 1): _offline_select_vehicle(_oid)))""",
 '17-delayed-select')
 
+# -------------------------------------------- AmmunitionPanel slots fix
+# The decompiled 0.9.22 function lost its final `else:` (uncompyle6 artifact):
+# after the artefact/booster branches it unconditionally built one more VO
+# with slotId=None. 0.9.22's FittingSlotVO tolerated an empty modulesData,
+# 0.9.21's does `modulesData[0]` -> IndexError during Hangar._populate when
+# the vehicle has no optional devices/equipment/boosters installed.
+# Restore the if/elif/else structure and never pass an empty list with
+# slotId=None (emit a plain empty-VO dict instead).
+rep("""        def _safe_getFittingSlotsData(vehicle, slotsRange, VoClass=None, itemsCache=None):
+            devices = []
+            VoClass = VoClass or _FSVO
+            itemTypeIDs = [_GTI[slotType] for slotType in slotsRange]
+            gatheredItems = itemsCache.items.getItemsEx(itemTypeIDs, _RC.CUSTOM((lambda item: item.isInstalled(vehicle))), vehicle.nationID)
+            for slotType in slotsRange:
+                slotTypeIdx = _GTI[slotType]
+                slotItems = [item for item in gatheredItems.itervalues() if item.itemTypeID == slotTypeIdx]
+                if slotType in _amp_mod.ARTEFACTS_SLOTS:
+                    for slotId in xrange(_NODS):
+                        devices.append(VoClass(slotItems, vehicle, slotType, slotId, _TTC.HANGAR_MODULE))
+
+                elif slotType in _amp_mod._BOOSTERS_SLOTS:
+                    for slotId in xrange(_BBLS):
+                        devices.append(VoClass(slotItems, vehicle, slotType, slotId, tooltipType=_TTC.BATTLE_BOOSTER))
+
+                elif not slotItems and slotType in _MODULE_ATTR_BY_SLOT_TYPE:
+                    try:
+                        installedCD = getattr(vehicle, _MODULE_ATTR_BY_SLOT_TYPE[slotType]).intCD
+                        installedItem = itemsCache.items.getItemByCD(installedCD)
+                        if installedItem is not None:
+                            slotItems = [
+                             installedItem]
+                    except Exception as _mfe:
+                        print '[OFFLINE] getFittingSlotsData fallback failed for %s: %s' % (slotType, _mfe)
+
+                devices.append(VoClass(slotItems, vehicle, slotType, tooltipType=_TTC.HANGAR_MODULE))
+
+            return devices""",
+"""        def _safe_getFittingSlotsData(vehicle, slotsRange, VoClass=None, itemsCache=None):
+            devices = []
+            VoClass = VoClass or _FSVO
+            itemTypeIDs = [_GTI[slotType] for slotType in slotsRange]
+            gatheredItems = itemsCache.items.getItemsEx(itemTypeIDs, _RC.CUSTOM((lambda item: item.isInstalled(vehicle))), vehicle.nationID)
+
+            def _empty_module_vo(slotType):
+                # 0.9.21 FittingSlotVO._prepareModule() unconditionally does
+                # modulesData[0] when slotId is None, so an empty module
+                # slot must not go through VoClass; emit the same dict the
+                # VO produces for "no module" instead.
+                return {'id': -1,
+                 'tooltip': '',
+                 'tooltipType': _TTC.COMPLEX,
+                 'slotType': slotType,
+                 'removable': True,
+                 'slotIndex': 0,
+                 'level': 0,
+                 'moduleLabel': 'empty'}
+
+            for slotType in slotsRange:
+                slotTypeIdx = _GTI[slotType]
+                slotItems = [item for item in gatheredItems.itervalues() if item.itemTypeID == slotTypeIdx]
+                if slotType in _amp_mod.ARTEFACTS_SLOTS:
+                    for slotId in xrange(_NODS):
+                        devices.append(VoClass(slotItems, vehicle, slotType, slotId, _TTC.HANGAR_MODULE))
+
+                elif slotType in _amp_mod._BOOSTERS_SLOTS:
+                    for slotId in xrange(_BBLS):
+                        devices.append(VoClass(slotItems, vehicle, slotType, slotId, tooltipType=_TTC.BATTLE_BOOSTER))
+
+                else:
+                    if not slotItems and slotType in _MODULE_ATTR_BY_SLOT_TYPE:
+                        try:
+                            installedCD = getattr(vehicle, _MODULE_ATTR_BY_SLOT_TYPE[slotType]).intCD
+                            installedItem = itemsCache.items.getItemByCD(installedCD)
+                            if installedItem is not None:
+                                slotItems = [
+                                 installedItem]
+                        except Exception as _mfe:
+                            print '[OFFLINE] getFittingSlotsData fallback failed for %s: %s' % (slotType, _mfe)
+
+                    if slotItems:
+                        devices.append(VoClass(slotItems, vehicle, slotType, tooltipType=_TTC.HANGAR_MODULE))
+                    else:
+                        devices.append(_empty_module_vo(slotType))
+
+            return devices""",
+'18-fitting-slots-else')
+
 open(path, 'w').write(src)
 print('ALL PORT EDITS APPLIED')
