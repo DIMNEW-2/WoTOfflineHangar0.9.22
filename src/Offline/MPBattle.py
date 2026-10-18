@@ -623,6 +623,7 @@ class _BattleClient(object):
         self._period_ticking = False
         self._script_input_probe = None
         self._poses = {}           # vid -> _VehiclePose
+        self._entity_vid = {}      # entityID -> vid
         self._sim_last = 0.0
         self._sim_dead = False
         self._targeting_sent = False
@@ -1032,10 +1033,11 @@ class _BattleClient(object):
                                                player.get('nick', u''), team)
             entity_id = BigWorld.createEntity(
                 'Vehicle', self._space_id, 0,
-                (spawn[0], y + 1.0, spawn[1]), (0.0, 0.0, yaw), props)
+                (spawn[0], y, spawn[1]), (0.0, 0.0, yaw), props)
             self._vehicles[vid] = entity_id
+            self._entity_vid[entity_id] = vid
             try:
-                pose = _VehiclePose((spawn[0], y + 1.0, spawn[1]), yaw)
+                pose = _VehiclePose((spawn[0], y, spawn[1]), yaw)
                 _fill_pose_params(pose, descr)
                 self._poses[vid] = pose
             except Exception:
@@ -1104,9 +1106,11 @@ class _BattleClient(object):
                 sim_pose = self._poses.get(
                     int(getattr(self.state, 'my_vid', 0) or 0))
                 if sim_pose is not None:
-                    own_pos = '(%.1f,%.1f v=%.1f att=%s)' % (
-                        sim_pose.x, sim_pose.z, sim_pose.speed,
-                        sim_pose.attached)
+                    own_pos = '(%.1f,%.1f v=%.1f att=%s pr=%.0f/%.0f)' \
+                        % (sim_pose.x, sim_pose.z, sim_pose.speed,
+                           sim_pose.attached,
+                           math.degrees(sim_pose.pitch),
+                           math.degrees(sim_pose.roll))
                 elif own is not None:
                     p = own.position
                     own_pos = '(%.1f,%.1f)' % (p[0], p[2])
@@ -1428,7 +1432,10 @@ class _BattleClient(object):
         center_y = self._terrain_y(pose.x, pose.z)
         if center_y is None:
             return
-        pose.y = center_y + 1.0
+        # The compound model origin sits at track-bottom level, so
+        # the pose Y is the terrain height itself (the earlier +1 m
+        # left every tank floating - real-client test #16).
+        pose.y = center_y
         sin_y = math.sin(pose.yaw)
         cos_y = math.cos(pose.yaw)
         front = self._terrain_y(pose.x + sin_y * pose.half_len,
@@ -1440,7 +1447,9 @@ class _BattleClient(object):
         left = self._terrain_y(pose.x - cos_y * pose.half_wid,
                                pose.z + sin_y * pose.half_wid)
         if front is not None and back is not None:
-            pose.pitch = math.atan2(front - back,
+            # Sign empirically corrected on the real client: the
+            # hull nosed down uphill with (front - back) (#16).
+            pose.pitch = math.atan2(back - front,
                                     2.0 * pose.half_len)
         if right is not None and left is not None:
             pose.roll = math.atan2(right - left,
@@ -1557,14 +1566,21 @@ class _BattleClient(object):
             _log('ownVehicleStabMProv bind failed:')
             traceback.print_exc()
         try:
+            # The steady calculator feeds the sniper/arcade aiming
+            # systems.  Stock relinkSources() points it at the dead
+            # native filter matrices (sniper camera stuck at the
+            # spawn point - real-client test #16), so bind its
+            # sources directly to the pose provider instead.
             handler = getattr(avatar, 'inputHandler', None)
             calc = getattr(handler, 'steadyVehicleMatrixCalculator',
                            None)
-            relink = getattr(calc, 'relinkSources', None)
-            if callable(relink):
-                relink()
+            if calc is not None:
+                out = calc.outputMProv
+                out.rotationSrc = pose.provider
+                out.translationSrc = pose.provider
+                calc.stabilisedMProv.target = pose.provider
         except Exception:
-            _log('steadyVehicleMatrixCalculator relink failed:')
+            _log('steadyVehicleMatrixCalculator bind failed:')
             traceback.print_exc()
         _log('own-vehicle camera matrices bound to pose provider')
 
@@ -1578,6 +1594,26 @@ class _BattleClient(object):
                     pose.provider or \
                     matrices.ownVehicleMatrix.target is not \
                     pose.provider:
+                self._bind_own_matrices(pose)
+                return
+        except Exception:
+            pass
+        try:
+            stab = getattr(avatar,
+                           '_PlayerAvatar__ownVehicleStabMProv', None)
+            if stab is not None and stab.target is not pose.provider:
+                self._bind_own_matrices(pose)
+                return
+        except Exception:
+            pass
+        try:
+            handler = getattr(avatar, 'inputHandler', None)
+            calc = getattr(handler, 'steadyVehicleMatrixCalculator',
+                           None)
+            if calc is not None and (
+                    calc.outputMProv.rotationSrc is not pose.provider
+                    or calc.stabilisedMProv.target is not
+                    pose.provider):
                 self._bind_own_matrices(pose)
         except Exception:
             pass
@@ -1597,6 +1633,36 @@ class _BattleClient(object):
             pass
         try:
             pose.set_aim(rotator.turretYaw, rotator.gunPitch)
+        except Exception:
+            pass
+        # Server echo: VehicleGunRotator.__syncWithServerTurretYaw
+        # snaps the predicted yaw back to vehicle.
+        # getServerGunAngles() (decoded gunAnglesPacked) whenever
+        # the deviation exceeds ~8deg + 0.4*traverse.  Retail
+        # servers stream that property continuously; without the
+        # echo the turret turned ~20deg and snapped back to the
+        # hull axis (real-client test #16).  Mirror our own angles
+        # into the property every sim tick.
+        if self._gun_limits is None:
+            return
+        try:
+            import BigWorld
+            import gun_rotation_shared
+            entity_id = self._vehicles.get(
+                int(getattr(self.state, 'my_vid', 0) or 0))
+            vehicle = BigWorld.entity(entity_id) if entity_id else None
+            if vehicle is None:
+                return
+            packed = int(gun_rotation_shared.encodeGunAngles(
+                rotator.turretYaw, rotator.gunPitch,
+                self._gun_limits))
+            prev = vehicle.gunAnglesPacked
+            if packed != prev:
+                vehicle.gunAnglesPacked = packed
+                notifier = getattr(vehicle, 'set_gunAnglesPacked',
+                                   None)
+                if callable(notifier):
+                    notifier(prev)
         except Exception:
             pass
 
@@ -1662,6 +1728,7 @@ class _BattleClient(object):
         import BigWorld
         _log('tearing down battle, returning to hangar')
         self._poses = {}
+        self._entity_vid = {}
         # Promote the hangar Account FIRST, while the Avatar entity is
         # still alive: the engine demotes the Avatar, whose stock
         # onBecomeNonPlayer stops the battle GUI session, destroys the
@@ -2109,6 +2176,26 @@ def _install_vehicle_patch():
             return False
 
     def _vehicle_getattribute(self, name):
+        if name in ('position', 'matrix'):
+            # Pose overlay: the native entity transform never moves
+            # on client-only vehicles, so Python consumers asking
+            # for the vehicle matrix/position (aiming systems,
+            # minimap, markers, sounds) would all see the spawn
+            # point.  Serve the kinematic pose instead.
+            try:
+                entity_id = orig_getattribute(self, 'id')
+                bridge = _MP_VEHICLE_BRIDGES.get(entity_id)
+                if bridge is not None:
+                    bc = bridge._bc
+                    vid = bc._entity_vid.get(entity_id)
+                    pose = bc._poses.get(vid) if vid else None
+                    if pose is not None:
+                        if name == 'matrix':
+                            return pose.provider
+                        import Math
+                        return Math.Vector3(pose.x, pose.y, pose.z)
+            except Exception:
+                pass
         if name in ('base', 'cell'):
             try:
                 bridge = _MP_VEHICLE_BRIDGES.get(
