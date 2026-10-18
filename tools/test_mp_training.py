@@ -186,6 +186,8 @@ check(row[0] == 11 and row[1] == u'Alice' and row[2] == 1 and row[4] == 1
 check(st['limits'][u'1']['maxCount'] == [15, 15]
       and st['limits'][u'2']['maxCount'] == [15, 15],
       'settings limits carry maxCount (assigned, unassigned) per team')
+check(st['bonusType'] == 2,
+      'settings carry bonusType (ARENA_BONUS_TYPE.TRAINING)')
 check(joined[0]['teamStates'] == [1, 1], 'both teams NOT_READY')
 chan_acts = acts(a_in, A.requestChannels)
 prb_chans = [d for d in chan_acts if d.get('data')
@@ -294,18 +296,44 @@ check(evs(a_in, 'resp')[0]['code'] == 0
 del a_in[:]
 del b_in[:]
 
-# team ready x2 -> battle refused after deferred tick
+# team ready needs players assigned on both sides (stock-like guard);
+# Bob currently sits unassigned (roster 18), team 2 has nobody assigned
+prb(srv, alice, cmd='teamReady', req=17, team=1)
+check(evs(a_in, 'resp')[0]['code'] == -1
+      and not upds(b_in, C.PREBATTLE_UPDATE.TEAM_STATES),
+      'teamReady refused with an empty opposing team')
+del a_in[:]
+del b_in[:]
+prb(srv, alice, cmd='assign', req=18, playerID=bob.vid, roster=2)
+del a_in[:]
+del b_in[:]
+
+# one-sided readiness auto-reverts (room must not stick "in queue")
 prb(srv, alice, cmd='teamReady', req=11, team=1)
 check(upds(b_in, C.PREBATTLE_UPDATE.TEAM_STATES) == [[2, 1]],
       'team1 READY broadcast')
+trn = srv.training
+check(len(trn._deferred) == 1, 'one-sided readiness timeout scheduled')
+trn._deferred[0] = (0.0, trn._deferred[0][1], trn._deferred[0][2])
 del a_in[:]
 del b_in[:]
-prb(srv, alice, cmd='teamReady', req=12, team=2)
+trn.on_tick()
+check(upds(a_in, C.PREBATTLE_UPDATE.TEAM_STATES) == [[1, 1]]
+      and upds(b_in, C.PREBATTLE_UPDATE.TEAM_STATES) == [[1, 1]]
+      and evs(a_in, 'sysNote'),
+      'one-sided readiness reverted with note')
+del a_in[:]
+del b_in[:]
+
+# both teams ready -> battle refused after deferred tick
+prb(srv, alice, cmd='teamReady', req=19, team=1)
+del a_in[:]
+del b_in[:]
+prb(srv, alice, cmd='teamReady', req=20, team=2)
 check(upds(b_in, C.PREBATTLE_UPDATE.TEAM_STATES) == [[2, 2]],
       'team2 READY broadcast')
-trn = srv.training
 check(len(trn._deferred) == 1, 'battle cancel deferred scheduled')
-trn._deferred[0] = (0.0, trn._deferred[0][1])
+trn._deferred[0] = (0.0, trn._deferred[0][1], trn._deferred[0][2])
 del a_in[:]
 del b_in[:]
 trn.on_tick()

@@ -53,6 +53,10 @@ _BATTLE_UNAVAILABLE_TEXT = u'Запуск боя недоступен в лок�
 _TEAM_CAPACITY = 15
 _ROOM_CAPACITY = 30
 _BATTLE_CANCEL_DELAY = 1.0
+# A single READY team locks most stock-GUI actions (invites, observer
+# switching, roster edits) until the other team readies up. Since no
+# battle can ever start here, do not let that state linger.
+_TEAM_READY_TIMEOUT = 5.0
 _PRB_CHANNEL_NAME = u'#chat:channels/training'
 
 
@@ -234,6 +238,10 @@ class _TrainingServer(object):
                               2: C.PREBATTLE_ROLE.TRAINING_DEFAULT},
                 'arenaVoipChannels': room.voip_channels,
                 'gameplayMask': 0,
+                # No SETTING_DEFAULTS fallback either; TrainingRoom reads
+                # settings['bonusType'] when computing observer limits.
+                'bonusType': getattr(getattr(C, 'ARENA_BONUS_TYPE', None),
+                                     'TRAINING', 2),
                 # TeamLimits has no LIMIT_DEFAULTS fallback for 'maxCount'
                 # (a (assigned, unassigned) pair) - the room GUI reads it
                 # unconditionally, so always send it.
@@ -506,6 +514,26 @@ class _TrainingServer(object):
                       lambda c, n=name, v=value: [n, v])
         self._resp(conn, msg, ok)
 
+    def _schedule_battle_cancel(self, room, delay):
+        key = ('battle-cancel', room.room_id)
+        self._deferred = [entry for entry in self._deferred
+                          if entry[1] != key]
+        self._deferred.append((time.time() + delay, key,
+                               lambda r=room: self._cancel_battle(r)))
+
+    def _drop_battle_cancel(self, room):
+        key = ('battle-cancel', room.room_id)
+        self._deferred = [entry for entry in self._deferred
+                          if entry[1] != key]
+
+    def _assigned_counts(self, room):
+        counts = {1: 0, 2: 0}
+        for member in room.members.itervalues():
+            team, assigned = _decode_roster(member.roster)
+            if assigned and team in counts:
+                counts[team] += 1
+        return counts
+
     def _op_team_ready(self, conn, msg):
         C = _const()
         room = self._room_of(conn)
@@ -513,14 +541,20 @@ class _TrainingServer(object):
         ok = (room is not None and conn.vid == room.creator_vid
               and team in (1, 2))
         if ok:
+            # Refusing to ready up against an empty team matches stock
+            # validation and, importantly, keeps the room out of the
+            # "in queue" state that blocks invites/observer/leaving.
+            counts = self._assigned_counts(room)
+            ok = counts[1] > 0 and counts[2] > 0
+        if ok:
             room.team_states[team] = C.PREBATTLE_TEAM_STATE.READY
             self._broadcast_team_states(room)
             states = self._team_states(room)
             if states[0] == C.PREBATTLE_TEAM_STATE.READY \
                     and states[1] == C.PREBATTLE_TEAM_STATE.READY:
-                self._deferred.append(
-                    (time.time() + _BATTLE_CANCEL_DELAY,
-                     lambda r=room: self._cancel_battle(r)))
+                self._schedule_battle_cancel(room, _BATTLE_CANCEL_DELAY)
+            else:
+                self._schedule_battle_cancel(room, _TEAM_READY_TIMEOUT)
         self._resp(conn, msg, ok)
 
     def _op_team_not_ready(self, conn, msg):
@@ -532,11 +566,15 @@ class _TrainingServer(object):
         if ok:
             room.team_states[team] = C.PREBATTLE_TEAM_STATE.NOT_READY
             self._broadcast_team_states(room)
+            if C.PREBATTLE_TEAM_STATE.READY not in self._team_states(room):
+                self._drop_battle_cancel(room)
         self._resp(conn, msg, ok)
 
     def _cancel_battle(self, room):
         C = _const()
         if room.room_id not in self.rooms:
+            return
+        if C.PREBATTLE_TEAM_STATE.READY not in self._team_states(room):
             return
         room.team_states = {1: C.PREBATTLE_TEAM_STATE.NOT_READY,
                             2: C.PREBATTLE_TEAM_STATE.NOT_READY}
@@ -718,7 +756,7 @@ class _TrainingServer(object):
             return
         self._deferred = [entry for entry in self._deferred
                            if entry[0] > now]
-        for _, fn in due:
+        for _, _key, fn in due:
             try:
                 fn()
             except Exception:
