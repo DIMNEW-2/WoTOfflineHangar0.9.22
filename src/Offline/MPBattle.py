@@ -152,6 +152,7 @@ class _VehiclePose(object):
         self.attach_fails = 0
         self.grounded_once = False
         self.on_model_changed = None
+        self.filter_proxy = None
         # Kinematic parameters (filled from the type descriptor).
         self.speed_fwd = 12.0
         self.speed_back = 4.0
@@ -627,6 +628,8 @@ class _BattleClient(object):
         self._sim_last = 0.0
         self._sim_dead = False
         self._targeting_sent = False
+        self._positions_last = 0.0
+        self._positions_failed = False
 
     # -- transport --------------------------------------------------------
 
@@ -1131,20 +1134,52 @@ class _BattleClient(object):
                     if rot is not None else None
             except Exception:
                 turret_info = '?'
+            try:
+                handler = getattr(avatar, 'inputHandler', None)
+                mode_name = getattr(
+                    handler, '_AvatarInputHandler__ctrlModeName', '?')
+            except Exception:
+                mode_name = '?'
             _log('diag tick %s: initProgress=%s gunRotator=%s '
                  'ownVehicleStarted=%s avatarVehicle=%s spaceLoad=%s '
                  'worldDraw=%s period=%s pos=%s input=%s srvT=%.1f '
-                 'cliT=%.1f turret=%s'
+                 'cliT=%.1f turret=%s mode=%s'
                  % (n, progress,
                     getattr(avatar, 'gunRotator', None) is not None,
                     own_started, getattr(avatar, 'vehicle', None),
                     space_load, world_draw,
                     getattr(getattr(avatar, 'arena', None),
                             'period', None), own_pos, self._cur_input,
-                    srv_t, cli_t, turret_info))
+                    srv_t, cli_t, turret_info, mode_name))
         except Exception:
             _log('diag tick %s failed:' % (n,))
             traceback.print_exc()
+        if n == 12:
+            # One-shot: does the minimap's AOI provider chain
+            # (WGTranslationOnlyMP <- vehicle.matrix) evaluate to
+            # the live pose for a remote vehicle?
+            try:
+                import Math
+                my_vid = int(getattr(self.state, 'my_vid', 0) or 0)
+                for vid, eid in self._vehicles.iteritems():
+                    if vid == my_vid:
+                        continue
+                    veh = BigWorld.entity(eid)
+                    pose = self._poses.get(vid)
+                    if veh is None or pose is None:
+                        continue
+                    direct = Math.Matrix(veh.matrix).translation
+                    mp = Math.WGTranslationOnlyMP()
+                    mp.source = veh.matrix
+                    chained = Math.Matrix(mp).translation
+                    _log('minimap chain vid=%s pose=(%.1f,%.1f) '
+                         'matrix=(%.1f,%.1f) translationMP=(%.1f,%.1f)'
+                         % (vid, pose.x, pose.z, direct[0], direct[2],
+                            chained[0], chained[2]))
+                    break
+            except Exception:
+                _log('minimap chain check failed:')
+                traceback.print_exc()
         if n < 9:
             BigWorld.callback(1.0, lambda: self._diag_tick(n + 1))
         elif n < 15:
@@ -1393,6 +1428,39 @@ class _BattleClient(object):
                 and avatar is not None:
             self._drive_own_aim(own_pose)
             self._reassert_own_binding(own_pose)
+        if avatar is not None and now - self._positions_last >= 0.25:
+            self._positions_last = now
+            self._feed_arena_positions(avatar)
+
+    def _feed_arena_positions(self, avatar):
+        # Retail servers stream ClientArena positions for the
+        # minimap via PlayerAvatar.updatePositions; without them
+        # minimap entries for the other vehicles never leave the
+        # UNDEFINED state (real-client test #17).  Indices are
+        # ranks in the sorted arena vehicle id order, mirroring
+        # ClientArena.__rebuildIndexToId.
+        try:
+            index_of = {}
+            for idx, eid in enumerate(
+                    sorted(self._vehicles.itervalues())):
+                index_of[eid] = idx
+            indices = []
+            positions = []
+            for vid, pose in self._poses.iteritems():
+                eid = self._vehicles.get(vid)
+                if eid is None or eid not in index_of:
+                    continue
+                indices.append(index_of[eid])
+                positions.append(pose.x)
+                positions.append(pose.z)
+            if indices:
+                avatar.updatePositions(tuple(indices),
+                                       tuple(positions))
+        except Exception:
+            if not self._positions_failed:
+                self._positions_failed = True
+                _log('arena positions feed failed:')
+                traceback.print_exc()
 
     def _integrate_pose(self, pose, move, rotate, dt):
         if move > 0:
@@ -2052,18 +2120,39 @@ def _install_avatar_patch():
 
 
 class _VehicleFilterSyncProxy(object):
-    """Delegates a WGVehicleFilter except the retail-only sync calls.
+    """Delegates a WGVehicleFilter except the retail-only sync calls
+    and - when a kinematic pose is attached - its matrix providers.
 
     ``syncGunAngles``/``syncStabilisedYPR`` submit samples to the
     native interpolation filter a server-driven Vehicle has behind
     it; on a client-only Vehicle that native filter is null and the
     call crashes the client. Everything else delegates untouched.
+    The native filter matrices never move without a server stream,
+    but stock lifecycle code keeps re-reading them (camera binds on
+    control-mode switches, steady-calculator relinks, appearance
+    refreshes); serving the live pose providers here makes every
+    such rebind capture the moving tank instead of the spawn pose
+    (sniper orientation reset, real-client test #17).
     """
 
-    def __init__(self, vehicle_filter):
+    def __init__(self, vehicle_filter, pose=None):
         object.__setattr__(self, '_vehicle_filter', vehicle_filter)
+        object.__setattr__(self, '_pose', pose)
 
     def __getattr__(self, name):
+        try:
+            pose = object.__getattribute__(self, '_pose')
+        except AttributeError:
+            pose = None
+        if pose is not None:
+            if name in ('stabilisedMatrix', 'bodyMatrix',
+                        'groundPlacingMatrix',
+                        'groundPlacingMatrixFiltered'):
+                return pose.provider
+            if name == 'turretMatrix':
+                return pose.aim.turretMatrix
+            if name == 'gunMatrix':
+                return pose.aim.gunMatrix
         return getattr(object.__getattribute__(self, '_vehicle_filter'),
                        name)
 
@@ -2175,6 +2264,18 @@ def _install_vehicle_patch():
         except AttributeError:
             return False
 
+    def _pose_for(vehicle):
+        try:
+            entity_id = orig_getattribute(vehicle, 'id')
+            bridge = _MP_VEHICLE_BRIDGES.get(entity_id)
+            if bridge is None:
+                return None
+            bc = bridge._bc
+            vid = bc._entity_vid.get(entity_id)
+            return bc._poses.get(vid) if vid else None
+        except Exception:
+            return None
+
     def _vehicle_getattribute(self, name):
         if name in ('position', 'matrix'):
             # Pose overlay: the native entity transform never moves
@@ -2182,20 +2283,15 @@ def _install_vehicle_patch():
             # for the vehicle matrix/position (aiming systems,
             # minimap, markers, sounds) would all see the spawn
             # point.  Serve the kinematic pose instead.
-            try:
-                entity_id = orig_getattribute(self, 'id')
-                bridge = _MP_VEHICLE_BRIDGES.get(entity_id)
-                if bridge is not None:
-                    bc = bridge._bc
-                    vid = bc._entity_vid.get(entity_id)
-                    pose = bc._poses.get(vid) if vid else None
-                    if pose is not None:
-                        if name == 'matrix':
-                            return pose.provider
-                        import Math
-                        return Math.Vector3(pose.x, pose.y, pose.z)
-            except Exception:
-                pass
+            pose = _pose_for(self)
+            if pose is not None:
+                if name == 'matrix':
+                    return pose.provider
+                try:
+                    import Math
+                    return Math.Vector3(pose.x, pose.y, pose.z)
+                except Exception:
+                    pass
         if name in ('base', 'cell'):
             try:
                 bridge = _MP_VEHICLE_BRIDGES.get(
@@ -2208,9 +2304,22 @@ def _install_vehicle_patch():
                 return orig_getattribute(self, '_mpFakeServer')
             except AttributeError:
                 pass
-        if name == 'filter' and _is_filter_scoped(self):
-            return _VehicleFilterSyncProxy(
-                orig_getattribute(self, 'filter'))
+        if name == 'filter':
+            pose = _pose_for(self)
+            if pose is not None:
+                # Always-on for battle vehicles (see the proxy
+                # docstring): one cached proxy per vehicle serves
+                # the live pose matrices and swallows the fatal
+                # sync calls for scoped and unscoped callers alike.
+                proxy = pose.filter_proxy
+                if proxy is None:
+                    proxy = _VehicleFilterSyncProxy(
+                        orig_getattribute(self, 'filter'), pose)
+                    pose.filter_proxy = proxy
+                return proxy
+            if _is_filter_scoped(self):
+                return _VehicleFilterSyncProxy(
+                    orig_getattribute(self, 'filter'))
         return orig_getattribute(self, name)
 
     Vehicle.__getattribute__ = _vehicle_getattribute

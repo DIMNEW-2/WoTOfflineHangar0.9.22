@@ -481,6 +481,53 @@ BTL._remove_scoped(_veh)
 _veh.filter.syncGunAngles(0.5, 0.25)
 check(_real_filter.synced == [(0.5, 0.25)],
       'real filter sync works again after scope')
+
+# always-on pose filter proxy: with a kinematic pose registered,
+# vehicle.filter serves the live pose matrices (stock lifecycle
+# rebinds must capture the moving tank) and swallows syncs even
+# outside the scoped sections.
+_pose2 = _FakePose()
+_pose2.provider = 'POSE_PROVIDER'
+_pose2.aim = _ns(turretMatrix='TURRET_M', gunMatrix='GUN_M')
+_pose2.filter_proxy = None
+_pose2.x, _pose2.z = 11.0, 22.0
+bc._vehicles[777] = 90210
+bc._entity_vid[90210] = 777
+bc._poses[777] = _pose2
+BTL._MP_VEHICLE_BRIDGES[90210] = bc._bridge
+_veh.id = 90210
+check(_veh.filter.stabilisedMatrix == 'POSE_PROVIDER',
+      'filter proxy serves pose stabilisedMatrix')
+check(_veh.filter.turretMatrix == 'TURRET_M',
+      'filter proxy serves pose turretMatrix')
+check(_veh.filter.speedInfo == 'speed',
+      'filter proxy still delegates other attrs')
+check(_veh.filter is _veh.filter, 'filter proxy cached per pose')
+_veh.filter.syncGunAngles(3.0, 4.0)
+check(_real_filter.synced == [(0.5, 0.25)],
+      'unscoped syncs swallowed for battle vehicles')
+check(_veh.matrix == 'POSE_PROVIDER',
+      'matrix overlay serves pose provider')
+
+# arena positions feed: indices are ranks in sorted entity-id
+# order, exactly like ClientArena.__rebuildIndexToId.
+_saved_vehicles = bc._vehicles
+_saved_poses = bc._poses
+_pose3 = _FakePose()
+_pose3.x, _pose3.z = -5.0, 7.0
+bc._vehicles = {777: 90210, 100: 90205}
+bc._poses = {777: _pose2, 100: _pose3}
+_pos_calls = []
+bc._feed_arena_positions(_ns(
+    updatePositions=lambda i, p: _pos_calls.append((i, p))))
+check(len(_pos_calls) == 1, 'arena positions feed sent once')
+_idx, _pos = _pos_calls[0]
+_by_index = dict((i, (_pos[2 * k], _pos[2 * k + 1]))
+                 for k, i in enumerate(_idx))
+check(_by_index == {0: (-5.0, 7.0), 1: (11.0, 22.0)},
+      'arena positions use sorted-id index ranks')
+bc._vehicles = _saved_vehicles
+bc._poses = _saved_poses
 try:
     _Vehicle().cell
     _raised = False
