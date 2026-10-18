@@ -101,20 +101,22 @@ def _cs():
 
 
 def current_veh_descr():
-    """Compact descriptor of the currently selected vehicle (0 if unknown).
+    """Hex-encoded compact descriptor of the current vehicle ('' if none).
 
-    Prebattle rosters carry vehCompDescr, but the stock client only sends
-    the inventory ID to the server - the LAN layer attaches the descriptor
-    explicitly so remote hangars can show the right tank.
+    Prebattle rosters carry vehCompDescr - a packed byte string built by
+    vehicles.VehicleDescr.makeCompactDescr() - but the stock client only
+    sends the inventory ID to the server. The LAN layer attaches the
+    descriptor explicitly (hex, so it survives JSON) so remote hangars
+    can show the right tank.
     """
     try:
         from CurrentVehicle import g_currentVehicle
         item = g_currentVehicle.item
-        if item is not None:
-            return int(item.intCD)
+        if item is not None and item.descriptor is not None:
+            return item.descriptor.makeCompactDescr().encode('hex')
     except Exception:
         pass
-    return 0
+    return ''
 
 
 def _sanitize_nick(nick):
@@ -211,7 +213,7 @@ class _Conn(object):
         # For prebattle rosters (MPTraining): the client's local player
         # entity ID (self-recognition in rosters) and current vehicle.
         self.entity_id = 0
-        self.veh_descr = 0
+        self.veh_descr = ''
 
 
 class _Chan(object):
@@ -413,16 +415,13 @@ class _MPServer(object):
                 self._act(other, cs.CHAT_ACTIONS.friendStatusUpdate,
                           data=[[self._view_id(conn.vid, other), bool(online)]])
 
-    def on_hello(self, conn, nick, self_dbid, entity_id=0, veh_descr=0):
+    def on_hello(self, conn, nick, self_dbid, entity_id=0, veh_descr=''):
         cs = _cs()
         try:
             conn.entity_id = int(entity_id)
         except Exception:
             conn.entity_id = 0
-        try:
-            conn.veh_descr = int(veh_descr)
-        except Exception:
-            conn.veh_descr = 0
+        conn.veh_descr = _u(veh_descr)  # hex compact descriptor
         base = _sanitize_nick(nick) or u'Commander'
         taken = set((c.nick.lower() for c in self.by_vid.itervalues()))
         candidate = base
@@ -1274,7 +1273,7 @@ class _Transport(object):
         mtype = msg.get('t')
         if mtype == 'hello':
             self.server.on_hello(conn, msg.get('nick', u''), msg.get('selfDBID', 1),
-                                 msg.get('entID', 0), msg.get('vehDescr', 0))
+                                 msg.get('entID', 0), msg.get('vehDescr', ''))
         elif not conn.vid:
             return
         elif mtype == 'prb':

@@ -163,10 +163,10 @@ def acts(inbox, item):
 # Server scenario
 # ============================================================================
 srv = MP._MPServer()
-alice, a_in = fresh(srv, 'a', u'Alice', 11, 111)
-bob, b_in = fresh(srv, 'b', u'Bob', 22, 222)
-carol, c_in = fresh(srv, 'c', u'Carol', 33, 333)
-dave, d_in = fresh(srv, 'd', u'Dave', 44, 444)
+alice, a_in = fresh(srv, 'a', u'Alice', 11, '0102')
+bob, b_in = fresh(srv, 'b', u'Bob', 22, '0304')
+carol, c_in = fresh(srv, 'c', u'Carol', 33, '0506')
+dave, d_in = fresh(srv, 'd', u'Dave', 44, '0708')
 
 # create room
 prb(srv, alice, cmd='createTraining', arenaTypeID=7, roundLength=900,
@@ -181,8 +181,11 @@ check(st['roles'][u'1'] == _TRAINING_CREATOR,  # JSON: int key -> str
       'creator role mask == TRAINING_CREATOR (self dbID view)')
 row = joined[0]['roster'][0]
 check(row[0] == 11 and row[1] == u'Alice' and row[2] == 1 and row[4] == 1
-      and row[5] == C.PREBATTLE_ACCOUNT_STATE.NOT_READY and row[7] == 111,
+      and row[5] == C.PREBATTLE_ACCOUNT_STATE.NOT_READY and row[7] == '0102',
       'creator roster row: self entityID/dbID, assigned team1, not ready')
+check(st['limits'][u'1']['maxCount'] == [15, 15]
+      and st['limits'][u'2']['maxCount'] == [15, 15],
+      'settings limits carry maxCount (assigned, unassigned) per team')
 check(joined[0]['teamStates'] == [1, 1], 'both teams NOT_READY')
 chan_acts = acts(a_in, A.requestChannels)
 prb_chans = [d for d in chan_acts if d.get('data')
@@ -249,14 +252,14 @@ check(len([d for d in acts(b_in, A.requestChannels)
 del a_in[:]
 del b_in[:]
 
-# Bob ready (selects another vehicle: vehDescr 999)
-prb(srv, bob, cmd='ready', req=5, vehInvID=12, vehDescr=999)
+# Bob ready (selects another vehicle: vehDescr '0a0b')
+prb(srv, bob, cmd='ready', req=5, vehInvID=12, vehDescr='0a0b')
 resp = evs(b_in, 'resp')
 check(resp and resp[0]['req'] == 5 and resp[0]['code'] == 0, 'ready resp ok')
 ps_a = upds(a_in, C.PREBATTLE_UPDATE.PLAYER_STATE)
 ps_b = upds(b_in, C.PREBATTLE_UPDATE.PLAYER_STATE)
 check(ps_a and ps_a[0][0] == bob.vid and ps_a[0][2] == C.PREBATTLE_ACCOUNT_STATE.READY
-      and ps_a[0][3] == 999, 'Alice sees Bob READY on vehicle 999')
+      and ps_a[0][3] == '0a0b', 'Alice sees Bob READY, vehicle hex on wire')
 check(ps_b and ps_b[0][0] == 22, 'Bob sees own PLAYER_STATE with entityID')
 del a_in[:]
 del b_in[:]
@@ -495,7 +498,7 @@ client.on_msg({'t': 'prb', 'ev': 'joined', 'prbID': 3,
                             'limits': {u'0': {}, u'1': {}, u'2': {}}},
                'props': {'wins': [0, 0, 0], 'battlesCount': 0,
                          'createTime': 123},
-               'roster': [[11, u'Me', 1, [], 1, 1, 100, 55, 0, 0, u'']],
+               'roster': [[11, u'Me', 1, [], 1, 1, 100, '0708', 0, 0, u'']],
                'teamStates': [1, 1]})
 kinds = [c[0] for c in player.calls]
 check(kinds == ['joined', 'upd', 'upd', 'upd', 'upd'],
@@ -505,8 +508,8 @@ check(player.calls[1][1] == C.PREBATTLE_UPDATE.SETTINGS
       and s_arg['roles'] == {1: _TRAINING_CREATOR}
       and s_arg['limits'] == {0: {}, 1: {}, 2: {}},
       'settings int keys restored after JSON')
-check(player.calls[3][2] == [(11, u'Me', 1, [], 1, 1, 100, 55, 0, 0, u'')],
-      'roster delivered as list of tuples')
+check(player.calls[3][2] == [(11, u'Me', 1, [], 1, 1, 100, '\x07\x08', 0, 0, u'')],
+      'roster delivered as tuples, vehCompDescr hex -> packed str')
 check(player.calls[4][2] == (1, 1), 'team states delivered as tuple')
 del player.calls[:]
 
@@ -519,10 +522,10 @@ check(player.calls[0][0] == 'list' and player.calls[0][2]
 del player.calls[:]
 
 client.on_msg({'t': 'prb', 'ev': 'rosterList', 'prbID': 9,
-               'rows': [[100001, u'Alice', 100001, 1, 4, 10, 77, 0, 0, u'']]})
-check(player.calls[0][2] == (9, [(100001, u'Alice', 100001, 1, 4, 10, 77,
+               'rows': [[100001, u'Alice', 100001, 1, 4, 10, '4d', 0, 0, u'']]})
+check(player.calls[0][2] == (9, [(100001, u'Alice', 100001, 1, 4, 10, 'M',
                                   0, 0, u'')]),
-      'receivePrebattleRoster blob with 10-tuples')
+      'receivePrebattleRoster blob with 10-tuples, veh decoded')
 del player.calls[:]
 
 client.on_msg({'t': 'prb', 'ev': 'invite', 'prbID': 4, 'creator': u'Alice',
@@ -545,16 +548,16 @@ del player.calls[:]
 
 # self-ID rewrite at delivery: host fell back to vid for our row
 client.on_msg({'t': 'prb', 'ev': 'upd', 'upd': C.PREBATTLE_UPDATE.ROSTER,
-               'arg': [[100005, u'Me', 1, [], 1, 4, 5, 55, 0, 0, u''],
-                       [100009, u'Other', 100009, [], 17, 1, 6, 66, 0, 0, u'']]})
+               'arg': [[100005, u'Me', 1, [], 1, 4, 5, '0708', 0, 0, u''],
+                       [100009, u'Other', 100009, [], 17, 1, 6, '090a', 0, 0, u'']]})
 rows = player.calls[-1][2]
 check(rows[0][0] == 77 and rows[1][0] == 100009,
       'roster self row vid -> local entity ID, others untouched')
 client.on_msg({'t': 'prb', 'ev': 'upd',
                'upd': C.PREBATTLE_UPDATE.PLAYER_STATE,
-               'arg': [100005, 1, 4, 55, 0, 0, u'']})
-check(player.calls[-1][2] == (77, 1, 4, 55, 0, 0, u''),
-      'PLAYER_STATE self ID rewritten')
+               'arg': [100005, 1, 4, '4d4e', 0, 0, u'']})
+check(player.calls[-1][2] == (77, 1, 4, 'MN', 0, 0, u''),
+      'PLAYER_STATE self ID rewritten, veh decoded')
 client.on_msg({'t': 'prb', 'ev': 'upd',
                'upd': C.PREBATTLE_UPDATE.PLAYER_ROSTER,
                'arg': [100005, 17, 2, 100005]})

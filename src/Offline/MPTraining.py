@@ -87,14 +87,27 @@ def _decode_roster(roster):
 
 
 def _veh_descr():
+    """Hex compact descriptor of the current vehicle ('' if unknown).
+
+    vehCompDescr in prebattle rosters is the packed byte string from
+    vehicles.VehicleDescr.makeCompactDescr() - NOT the item type CD.
+    """
     try:
         from CurrentVehicle import g_currentVehicle
         item = g_currentVehicle.item
-        if item is not None:
-            return int(item.intCD)
+        if item is not None and item.descriptor is not None:
+            return item.descriptor.makeCompactDescr().encode('hex')
     except Exception:
         pass
-    return 0
+    return ''
+
+
+def _veh_bytes(hex_descr):
+    """Decode a wire (hex) vehCompDescr back to the packed byte string."""
+    try:
+        return str(hex_descr).decode('hex') if hex_descr else ''
+    except Exception:
+        return ''
 
 
 # ---------------------------------------------------------------------------
@@ -221,7 +234,12 @@ class _TrainingServer(object):
                               2: C.PREBATTLE_ROLE.TRAINING_DEFAULT},
                 'arenaVoipChannels': room.voip_channels,
                 'gameplayMask': 0,
-                'limits': {0: {}, 1: {}, 2: {}}}
+                # TeamLimits has no LIMIT_DEFAULTS fallback for 'maxCount'
+                # (a (assigned, unassigned) pair) - the room GUI reads it
+                # unconditionally, so always send it.
+                'limits': {0: {'maxCount': [_TEAM_CAPACITY, _TEAM_CAPACITY]},
+                           1: {'maxCount': [_TEAM_CAPACITY, _TEAM_CAPACITY]},
+                           2: {'maxCount': [_TEAM_CAPACITY, _TEAM_CAPACITY]}}}
 
     def _props(self, room):
         return {'wins': [0, 0, 0], 'battlesCount': 0,
@@ -419,10 +437,10 @@ class _TrainingServer(object):
                 member.state = int(msg.get('state',
                                            C.PREBATTLE_ACCOUNT_STATE.NOT_READY)
                                    or C.PREBATTLE_ACCOUNT_STATE.NOT_READY)
-            veh = msg.get('vehDescr')
+            veh = _u(msg.get('vehDescr') or '')
             if veh:
-                member.veh_descr = int(veh)
-                conn.veh_descr = member.veh_descr
+                member.veh_descr = veh
+                conn.veh_descr = veh
             self._broadcast_player_state(room, conn.vid)
         self._resp(conn, msg, ok)
 
@@ -893,6 +911,8 @@ class _TrainingClient(object):
         row = list(row)
         if row:
             row[0] = self._tr_id(row[0])
+        if len(row) > 7:
+            row[7] = _veh_bytes(row[7])  # vehCompDescr: hex -> packed str
         return tuple(row)
 
     def _fix_upd_arg(self, upd, arg):
@@ -905,6 +925,8 @@ class _TrainingClient(object):
             arg = list(arg or [])
             if arg:
                 arg[0] = self._tr_id(arg[0])
+            if upd == U.PLAYER_STATE and len(arg) > 3:
+                arg[3] = _veh_bytes(arg[3])
             return tuple(arg)
         if upd == U.PLAYER_ROSTER:
             arg = list(arg or [])
@@ -972,7 +994,14 @@ class _TrainingClient(object):
                  items), -1))
             player.receivePrebattles(True, data)
         elif ev == 'rosterList':
-            rows = [tuple(row) for row in msg.get('rows') or []]
+            rows = []
+            for row in msg.get('rows') or []:
+                row = list(row)
+                if row:
+                    row[0] = self._tr_id(row[0])
+                if len(row) > 6:
+                    row[6] = _veh_bytes(row[6])  # 10-tuple vehCompDescr
+                rows.append(tuple(row))
             data = zlib.compress(cPickle.dumps(
                 (int(msg.get('prbID', 0)), rows), -1))
             player.receivePrebattleRoster(True, data)
