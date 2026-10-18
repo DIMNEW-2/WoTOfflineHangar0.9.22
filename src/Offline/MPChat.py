@@ -556,6 +556,17 @@ class _MPServer(object):
         if not chan.members and not chan.system and not chan.invited and chan.flags & cs.CHAT_CHANNEL_PRIVATE:
             self.channels.pop(chan.id, None)
 
+    def _replay_history(self, chan, conn):
+        """Re-send recent history to one member. Must follow EVERY
+        selfEnter we emit: the stock client clears the channel's
+        message history on each selfEnter (setJoined/clearHistory),
+        expecting the server to refill it - a bare selfEnter used to
+        wipe the visible conversation ("history not restored")."""
+        cs = _cs()
+        for when, vid, nick, group, text in chan.history[-30:]:
+            self._act(conn, cs.CHAT_ACTIONS.broadcast, channel=chan.id,
+                      data=text, originator_vid=vid, group=group, when=when)
+
     def _add_member(self, chan, conn):
         cs = _cs()
         chan.members.add(conn.vid)
@@ -569,9 +580,7 @@ class _MPServer(object):
             if other is not None:
                 self._act(other, cs.CHAT_ACTIONS.enter, channel=chan.id, originator_vid=conn.vid)
         # Replay recent history to the joiner only.
-        for when, vid, nick, group, text in chan.history[-30:]:
-            self._act(conn, cs.CHAT_ACTIONS.broadcast, channel=chan.id,
-                      data=text, originator_vid=vid, group=group, when=when)
+        self._replay_history(chan, conn)
 
     def _find_chan_by_name(self, name):
         lowered = _u(name).lower()
@@ -639,7 +648,10 @@ class _MPServer(object):
             if chan is None:
                 self._fail(conn, A.selfEnter, R.channelNotExists, channel=chan_id, requestID=req)
             elif conn.vid in chan.members:
+                # Even for an existing member the client wipes its
+                # history on selfEnter, so always refill it.
                 self._act(conn, A.selfEnter, channel=chan.id, originator_vid=conn.vid, requestID=req)
+                self._replay_history(chan, conn)
             elif self._banned(chan, conn.vid):
                 end = chan.banned.get(conn.vid, -1)
                 self._fail(conn, A.selfEnter, R.memberBanned, channel=chan.id,
@@ -796,7 +808,10 @@ class _MPServer(object):
                 if conn.vid not in chan.members:
                     self._add_member(chan, conn)
                 else:
+                    # Re-opening an existing private chat: refill the
+                    # history the client just wiped on selfEnter.
                     self._act(conn, A.selfEnter, channel=chan.id, originator_vid=conn.vid)
+                    self._replay_history(chan, conn)
         elif cmd == C.findUser:
             # Legacy BW search; the lobby UI uses BW_CHAT2 search instead.
             self._act(conn, A.findUsers, data=[], requestID=req)

@@ -324,6 +324,13 @@ del c_in[:]
 cmd(server, carol, C.enterChatChannel, chan=1)
 replays = [a['data'] for a in acts_of(c_in, A.broadcast)]
 check(replays == [u'Hello Bob!', u'Hi Alice'], 'history replayed to late joiner: %r' % (replays,))
+# The stock client clears channel history on EVERY selfEnter, so a
+# re-enter by an existing member must be followed by a history refill.
+del a_in[:]
+cmd(server, alice, C.enterChatChannel, chan=1)
+check(len(acts_of(a_in, A.selfEnter)) == 1
+      and [a['data'] for a in acts_of(a_in, A.broadcast)] == [u'Hello Bob!', u'Hi Alice'],
+      're-enter by existing member refills history after selfEnter')
 del a_in[:]
 server.detach('b')
 left = acts_of(a_in, A.leave)
@@ -407,6 +414,10 @@ erin3, e3_in = fresh_conn(srv2, 'e3', u'Erin')
 del d2_in[:]
 cmd(srv2, dave2, C.createPrivate, i64=erin_vid, s1=u'Erin')
 check([a['data'] for a in acts_of(d2_in, A.broadcast)] == [u'private memory'], 'private history restored')
+del d2_in[:]
+cmd(srv2, dave2, C.createPrivate, i64=erin_vid, s1=u'Erin')
+check([a['data'] for a in acts_of(d2_in, A.broadcast)] == [u'private memory'],
+      're-opened private chat refills history after selfEnter')
 srv2.flush_state(force=True)
 os.remove(state_file)
 if os.path.exists(state_file + '.tmp'):
