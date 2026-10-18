@@ -615,6 +615,7 @@ class _BattleClient(object):
         # From here on every Vehicle is one of ours: engage the
         # filter-sync proxy scoping (see _BATTLE_ACTIVE).
         _BATTLE_ACTIVE[0] = True
+        _BATTLE_LOADING_SHOWN[0] = False
         self._space_id = BigWorld.createSpace()
         self._mapping_id = BigWorld.addSpaceGeometryMapping(
             self._space_id, None, 'spaces/' + arena_type.geometryName)
@@ -903,16 +904,30 @@ class _BattleClient(object):
                 int(getattr(self.state, 'my_vid', 0) or 0))
             own = BigWorld.entity(own_id) if own_id else None
             own_started = getattr(own, 'isStarted', None)
+            try:
+                space_load = BigWorld.spaceLoadStatus()
+            except Exception:
+                space_load = '?'
+            try:
+                world_draw = BigWorld.worldDrawEnabled()
+            except Exception:
+                world_draw = '?'
             _log('diag tick %s: initProgress=%s gunRotator=%s '
-                 'ownVehicleStarted=%s avatarVehicle=%s'
+                 'ownVehicleStarted=%s avatarVehicle=%s spaceLoad=%s '
+                 'worldDraw=%s period=%s'
                  % (n, progress,
                     getattr(avatar, 'gunRotator', None) is not None,
-                    own_started, getattr(avatar, 'vehicle', None)))
+                    own_started, getattr(avatar, 'vehicle', None),
+                    space_load, world_draw,
+                    getattr(getattr(avatar, 'arena', None),
+                            'period', None)))
         except Exception:
             _log('diag tick %s failed:' % (n,))
             traceback.print_exc()
-        if n < 4:
+        if n < 9:
             BigWorld.callback(1.0, lambda: self._diag_tick(n + 1))
+        elif n < 15:
+            BigWorld.callback(5.0, lambda: self._diag_tick(n + 1))
 
     def _publish_period(self, period, length):
         if self._avatar is None:
@@ -967,16 +982,30 @@ class _BattleClient(object):
         if avatar is None or not vehicle_id:
             return
         import BigWorld
-        try:
-            avatar.onVehicleChanged()
-        except Exception:
-            _log('onVehicleChanged emulation failed:')
-            traceback.print_exc()
         vehicle = None
         try:
             vehicle = BigWorld.entity(vehicle_id)
         except Exception:
             vehicle = None
+        if vehicle is not None:
+            # The engine sets .vehicle itself on a real server and
+            # only then fires onVehicleChanged. Diag ticks on the
+            # real client showed avatar.vehicle stayed None, so try
+            # the assignment: if the client-side attribute is
+            # read-only this raises and we keep the old behaviour.
+            try:
+                avatar.vehicle = vehicle
+                _log('bindToVehicle: avatar.vehicle set to %s'
+                     % (vehicle_id,))
+            except Exception:
+                _log('bindToVehicle: avatar.vehicle assignment '
+                     'rejected:')
+                traceback.print_exc()
+        try:
+            avatar.onVehicleChanged()
+        except Exception:
+            _log('onVehicleChanged emulation failed:')
+            traceback.print_exc()
         if vehicle is None:
             _log('bindToVehicle: vehicle entity %s not found'
                  % (vehicle_id,))
@@ -1138,6 +1167,7 @@ class _BattleClient(object):
             except Exception:
                 self._restore_lobby()
         _BATTLE_ACTIVE[0] = False
+        _BATTLE_LOADING_SHOWN[0] = False
         self._tearing_down = False
         _log('back in hangar')
 
@@ -1423,6 +1453,12 @@ class _VehicleFilterSyncProxy(object):
 # other battle vehicles, and the hangar never sets this flag.
 _BATTLE_ACTIVE = [False]
 
+# Set once the app loader has been asked for the BATTLE_LOADING gui
+# space in the current battle. The app-loader state machine only
+# allows Lobby -> BattleLoading -> Battle; see
+# _install_app_loader_patch for the race this guards.
+_BATTLE_LOADING_SHOWN = [False]
+
 # entity id -> _FakeServer bridge, for Vehicle base/cell routing
 # without depending on attribute storage on engine entities.
 _MP_VEHICLE_BRIDGES = {}
@@ -1594,7 +1630,101 @@ def _install_account_patch():
         return result
 
     PlayerAccount.onBecomePlayer = _on_become_player
+
+    # Teardown re-promotes the Account BEFORE the battle Avatar and
+    # Vehicles are destroyed, so stock cleanup that asks
+    # BigWorld.player() for Avatar-only members lands on the Account
+    # ("'PlayerAccount' object has no attribute 'getVehicleAttached'"
+    # etc., real-client test 2026-10-18 #10). Those AttributeErrors
+    # aborted Avatar.__destroyGUI midway. Inert stubs let the stock
+    # cleanup run to completion; a retail Account never receives
+    # these calls, so the stubs are dead weight in the hangar.
+    if not hasattr(PlayerAccount, 'getVehicleAttached'):
+        def _account_get_vehicle_attached(self):
+            return None
+
+        PlayerAccount.getVehicleAttached = (
+            _account_get_vehicle_attached)
+    if not hasattr(PlayerAccount, 'vehicleTypeDescriptor'):
+        PlayerAccount.vehicleTypeDescriptor = None
+    if not hasattr(PlayerAccount, 'vehicle_onLeaveWorld'):
+        def _account_vehicle_on_leave_world(self, vehicle):
+            # Mirror the essential part of
+            # Avatar.vehicle_onLeaveWorld: Vehicle.onLeaveWorld
+            # asserts the visual is stopped right after this call.
+            try:
+                if getattr(vehicle, 'isStarted', False):
+                    vehicle.stopVisual(True)
+            except Exception:
+                pass
+
+        PlayerAccount.vehicle_onLeaveWorld = (
+            _account_vehicle_on_leave_world)
+
     PlayerAccount._mpBattlePatched = True
+
+
+def _install_app_loader_patch():
+    # The stock app-loader state machine only allows
+    # Lobby -> BattleLoading -> Battle. Retail reaches
+    # ArenaLoadController.arenaLoadCompleted (-> showBattlePage)
+    # seconds after showBattleLoading because a server-driven space
+    # loads slowly. Our client-only space is already loaded and
+    # world drawing is still enabled from the hangar, so the
+    # ArenaSpaceLoadListener completes on its first poll and
+    # showBattlePage races AHEAD of showBattleLoading; the state
+    # machine rejects Lobby -> Battle ("State can not be switched
+    # (LobbyState(), guiSpaceID = 6)") and the one-shot listener
+    # never retries - the battle loading screen stays up forever
+    # (real-client test 2026-10-18 #10). Track the loading call and
+    # insert it first when the page call wins the race. The loader
+    # singleton uses __slots__, so patch its class.
+    try:
+        from gui.app_loader import g_appLoader
+    except Exception:
+        _log('app loader patch: g_appLoader import failed:')
+        traceback.print_exc()
+        return
+    loader_cls = type(g_appLoader)
+    if getattr(loader_cls, '_mpBattlePatched', False):
+        return
+    orig_show_loading = getattr(loader_cls, 'showBattleLoading', None)
+    orig_show_page = getattr(loader_cls, 'showBattlePage', None)
+    if orig_show_loading is None or orig_show_page is None:
+        _log('app loader patch: showBattleLoading/showBattlePage '
+             'missing on %s' % (loader_cls,))
+        return
+
+    def _show_battle_loading(self):
+        if _BATTLE_ACTIVE[0]:
+            _BATTLE_LOADING_SHOWN[0] = True
+            _log('appLoader.showBattleLoading')
+            _diag_flush()
+        return orig_show_loading(self)
+
+    def _show_battle_page(self):
+        if _BATTLE_ACTIVE[0]:
+            _log('appLoader.showBattlePage')
+            _diag_flush()
+            if not _BATTLE_LOADING_SHOWN[0]:
+                _log('showBattlePage raced ahead of showBattleLoading'
+                     ' - entering battle loading state first')
+                _diag_flush()
+                try:
+                    _show_battle_loading(self)
+                except Exception:
+                    _log('pre-emptive showBattleLoading failed:')
+                    traceback.print_exc()
+        return orig_show_page(self)
+
+    try:
+        loader_cls.showBattleLoading = _show_battle_loading
+        loader_cls.showBattlePage = _show_battle_page
+        loader_cls._mpBattlePatched = True
+        _log('app loader patch installed')
+    except Exception:
+        _log('app loader patch FAILED:')
+        traceback.print_exc()
 
 
 def _diag_wrap(cls, attr_name, label):
@@ -1664,6 +1794,17 @@ def _install_diag_patches():
                    'Avatar.vehicle_onEnterWorld')
         _diag_wrap(PlayerAvatar, '_PlayerAvatar__startVehicleVisual',
                    'Avatar.__startVehicleVisual')
+    except Exception:
+        pass
+    try:
+        from gui.battle_control.controllers.arena_load_ctrl import \
+            ArenaLoadController
+        _diag_wrap(ArenaLoadController, 'spaceLoadStarted',
+                   'ArenaLoadController.spaceLoadStarted')
+        _diag_wrap(ArenaLoadController, 'spaceLoadCompleted',
+                   'ArenaLoadController.spaceLoadCompleted')
+        _diag_wrap(ArenaLoadController, 'arenaLoadCompleted',
+                   'ArenaLoadController.arenaLoadCompleted')
     except Exception:
         pass
     try:
@@ -1809,6 +1950,7 @@ def install(state):
     _install_avatar_patch()
     _install_vehicle_patch()
     _install_account_patch()
+    _install_app_loader_patch()
     _install_diag_patches()
     _log('battle client patches installed')
     return client

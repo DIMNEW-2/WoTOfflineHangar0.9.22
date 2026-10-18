@@ -1056,7 +1056,7 @@ def init_offline():
                'tutorialsCompleted': 0}
             if not BigWorld.player():
                 _initial_server_settings = {'voipDomain': '', 'regional_settings': {'starting_time_of_a_new_day': 0, 
-                                         'starting_day_of_a_new_week': 0}, 
+                                         'starting_day_of_a_new_week': 0, 'starting_time_of_a_new_game_day': 3}, 
                    'roaming': (
                              0, 0, []), 
                    'wallet': (
@@ -1068,7 +1068,7 @@ def init_offline():
                    'initialServerSettings': _initial_server_settings, 
                    'serverSettings': {'voipDomain': '', 
                                       'regional_settings': {'starting_time_of_a_new_day': 0, 
-                                                            'starting_day_of_a_new_week': 0}, 
+                                                            'starting_day_of_a_new_week': 0, 'starting_time_of_a_new_game_day': 3}, 
                                       'roaming': (
                                                 0, 0, []), 
                                       'wallet': (
