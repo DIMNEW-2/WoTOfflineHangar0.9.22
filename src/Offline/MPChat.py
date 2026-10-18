@@ -499,6 +499,7 @@ class _MPServer(object):
                         if other is not None:
                             self._add_member(chan, other)
                 group = self._group_of(chan, conn.vid)
+                _log('chat #%s %s: %s' % (chan.id, _b(conn.nick), _b(s1)[:200]))
                 chan.history.append((time.time(), conn.vid, conn.nick, group, s1))
                 if len(chan.history) > _HISTORY_LIMIT:
                     chan.history = chan.history[-_HISTORY_LIMIT:]
@@ -1105,6 +1106,30 @@ class _ClientState(object):
         except Exception:
             return False
 
+    def _connect_all_protos(self, entry, scope):
+        """Connect every enabled messenger proto plugin, one by one.
+
+        ProtoPluginsDecorator.connect() walks all plugins in a single
+        call; offline BW_CHAT2 raises inside VOIP start (the fake server
+        settings have no 'voipUserDomain') and aborts the walk, so the
+        remaining plugins would only connect depending on dict order.
+        Mirror the decorator's enabled-filtering but isolate each
+        plugin in its own try/except."""
+        from messenger.proto import ServerSettings
+        plugins = getattr(entry.protos, '__readonly__', None)
+        settings = getattr(ServerSettings, '__readonly__', None)
+        if not plugins or settings is None:
+            entry.protos.connect(scope)
+            return
+        for protoName, plugin in plugins.iteritems():
+            if protoName not in settings or not settings[protoName].isEnabled():
+                continue
+            try:
+                plugin.connect(scope)
+            except Exception:
+                _log('messenger lobby init: %s proto connect failed:' % protoName)
+                traceback.print_exc()
+
     def _ensure_messenger_lobby(self):
         """Replay MessengerEntry's lobby handlers, which never fire
         offline: Manager does not call PlayerAccount.onAccountBecomePlayer,
@@ -1128,7 +1153,7 @@ class _ClientState(object):
         # storage.restoreFromCache, protos.view(LOBBY)).
         steps = (('g_settings.update', g_settings.update, ()),
          ('storage.switch', entry.storage.switch, (scope,)),
-         ('protos.connect', entry.protos.connect, (scope,)),
+         ('protos.connect', lambda: self._connect_all_protos(entry, scope), ()),
          ('gui.switch', entry.gui.switch, (scope,)),
          ('onAccountShowGUI', entry.onAccountShowGUI, ()))
         for name, fn, args in steps:
@@ -1294,6 +1319,19 @@ def on_account_ready(player):
     if cfg['mode'] == 'off':
         _log('local multiplayer disabled by config (mode=off)')
         return
+    # Offline the account entity keeps databaseID == 0 (never populated
+    # by a server). The messenger treats 0 as "no current player":
+    # CurrentUserEntity is never created and isCurrentPlayer() never
+    # matches channel owners / private interlocutors. Align it with the
+    # self DBID the MP protocol already assumes (same trick Manager
+    # uses for player.name).
+    try:
+        if not getattr(player, 'databaseID', 0):
+            player.databaseID = 1
+            _log('player.databaseID force-set to 1 (was 0)')
+    except Exception:
+        _log('player.databaseID force-set failed (non-fatal):')
+        traceback.print_exc()
     # The stock PlayerAccount.onAccountBecomePlayer (which switches the
     # chat proxy) is replaced by Manager's per-subsystem forcing, so make
     # sure chat callbacks are wired to our account entity.
