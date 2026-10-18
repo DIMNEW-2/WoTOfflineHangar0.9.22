@@ -616,6 +616,11 @@ class _BattleClient(object):
         # filter-sync proxy scoping (see _BATTLE_ACTIVE).
         _BATTLE_ACTIVE[0] = True
         _BATTLE_LOADING_SHOWN[0] = False
+        _BATTLE_PAGE_POPULATED[0] = False
+        _BATTLE_PAGE_DONE[0] = False
+        _PENDING_BATTLE_PAGE[0] = None
+        _AVATAR_BOUND_VEHICLE[0] = None
+        _ensure_battle_page_patch()
         self._space_id = BigWorld.createSpace()
         self._mapping_id = BigWorld.addSpaceGeometryMapping(
             self._space_id, None, 'spaces/' + arena_type.geometryName)
@@ -989,18 +994,14 @@ class _BattleClient(object):
             vehicle = None
         if vehicle is not None:
             # The engine sets .vehicle itself on a real server and
-            # only then fires onVehicleChanged. Diag ticks on the
-            # real client showed avatar.vehicle stayed None, so try
-            # the assignment: if the client-side attribute is
-            # read-only this raises and we keep the old behaviour.
-            try:
-                avatar.vehicle = vehicle
-                _log('bindToVehicle: avatar.vehicle set to %s'
-                     % (vehicle_id,))
-            except Exception:
-                _log('bindToVehicle: avatar.vehicle assignment '
-                     'rejected:')
-                traceback.print_exc()
+            # only then fires onVehicleChanged. The attribute is
+            # read-only from Python ("attribute vehicle in
+            # PlayerAvatar is read-only", test #11), so register
+            # the vehicle for the __getattribute__ interception
+            # instead, BEFORE onVehicleChanged reads self.vehicle.
+            _AVATAR_BOUND_VEHICLE[0] = vehicle
+            _log('bindToVehicle: avatar.vehicle bound to %s (via '
+                 '__getattribute__)' % (vehicle_id,))
         try:
             avatar.onVehicleChanged()
         except Exception:
@@ -1168,6 +1169,10 @@ class _BattleClient(object):
                 self._restore_lobby()
         _BATTLE_ACTIVE[0] = False
         _BATTLE_LOADING_SHOWN[0] = False
+        _BATTLE_PAGE_POPULATED[0] = False
+        _BATTLE_PAGE_DONE[0] = False
+        _PENDING_BATTLE_PAGE[0] = None
+        _AVATAR_BOUND_VEHICLE[0] = None
         self._tearing_down = False
         _log('back in hangar')
 
@@ -1241,6 +1246,16 @@ def _install_avatar_patch():
                     return orig_getattribute(self, 'fakeServer')
             except AttributeError:
                 pass
+        elif name == 'vehicle' and _BATTLE_ACTIVE[0]:
+            # Read-only engine attribute, always None for a
+            # client-only Avatar (assignment raises TypeError,
+            # real-client test 2026-10-18 #11). Serve the vehicle
+            # our bind emulation attached so stock Python code
+            # (onVehicleChanged, input handler, GUI) sees the same
+            # value a server-driven Avatar would have.
+            bound = _AVATAR_BOUND_VEHICLE[0]
+            if bound is not None:
+                return bound
         return orig_getattribute(self, name)
 
     PlayerAvatar.__getattribute__ = _avatar_getattribute
@@ -1459,6 +1474,34 @@ _BATTLE_ACTIVE = [False]
 # _install_app_loader_patch for the race this guards.
 _BATTLE_LOADING_SHOWN = [False]
 
+# Set by the SharedPage._populate wrap once the DAAPI battle page
+# exists and listens for the BATTLE_LOADING toggle event; the
+# app-loader wrapper defers the real showBattlePage until then
+# (see _install_app_loader_patch).
+_BATTLE_PAGE_POPULATED = [False]
+
+# Set once the original showBattlePage has actually executed in
+# the current battle; later showBattleLoading calls (arena-info
+# invalidations) are swallowed instead of tripping the state
+# machine's "can not be switched" error.
+_BATTLE_PAGE_DONE = [False]
+
+# [loader, ticks_left] while a showBattlePage call is deferred
+# waiting for the battle page to populate.
+_PENDING_BATTLE_PAGE = [None]
+
+# True once SharedPage._populate is wrapped (the daapi module may
+# not be importable until the SF battle packages load, so the
+# wrap is retried lazily).
+_BATTLE_PAGE_PATCHED = [False]
+
+# The Vehicle entity our bind emulation attached the Avatar to.
+# PlayerAvatar.vehicle is a read-only engine attribute and stays
+# None for a client-only Avatar, so the patched
+# PlayerAvatar.__getattribute__ serves this entity for Python
+# code asking for .vehicle during a battle.
+_AVATAR_BOUND_VEHICLE = [None]
+
 # entity id -> _FakeServer bridge, for Vehicle base/cell routing
 # without depending on attribute storage on engine entities.
 _MP_VEHICLE_BRIDGES = {}
@@ -1664,6 +1707,78 @@ def _install_account_patch():
     PlayerAccount._mpBattlePatched = True
 
 
+def _ensure_battle_page_patch():
+    # Wrap SharedPage._populate to learn when the DAAPI battle
+    # page exists (and therefore listens for the BATTLE_LOADING
+    # toggle event). Imported lazily: the battle daapi modules
+    # may not be importable before the SF battle packages load,
+    # so this is retried from battle enter and the deferral poll.
+    if _BATTLE_PAGE_PATCHED[0]:
+        return
+    try:
+        from gui.Scaleform.daapi.view.battle.shared.page import \
+            SharedPage
+    except Exception:
+        return
+    orig_populate = getattr(SharedPage, '_populate', None)
+    if orig_populate is None or getattr(orig_populate,
+                                         '_mpBattlePopulate', False):
+        _BATTLE_PAGE_PATCHED[0] = True
+        return
+
+    def _battle_page_populate(self):
+        result = orig_populate(self)
+        if _BATTLE_ACTIVE[0] and not _BATTLE_PAGE_POPULATED[0]:
+            _BATTLE_PAGE_POPULATED[0] = True
+            _log('battle page populated (%s)'
+                 % (type(self).__name__,))
+            _diag_flush()
+        return result
+
+    _battle_page_populate._mpBattlePopulate = True
+    try:
+        SharedPage._populate = _battle_page_populate
+        _BATTLE_PAGE_PATCHED[0] = True
+        _log('battle page populate wrap installed')
+    except Exception:
+        _log('battle page populate wrap FAILED:')
+        traceback.print_exc()
+
+
+def _poll_pending_battle_page(orig_show_page):
+    pending = _PENDING_BATTLE_PAGE[0]
+    if pending is None:
+        return
+    loader, ticks_left = pending
+    if not _BATTLE_ACTIVE[0]:
+        _PENDING_BATTLE_PAGE[0] = None
+        return
+    _ensure_battle_page_patch()
+    if _BATTLE_PAGE_POPULATED[0] or ticks_left <= 0:
+        _PENDING_BATTLE_PAGE[0] = None
+        if _BATTLE_PAGE_POPULATED[0]:
+            _log('battle page ready - executing deferred '
+                 'showBattlePage')
+        else:
+            _log('showBattlePage deferral timed out - showing '
+                 'battle page anyway')
+        _diag_flush()
+        try:
+            orig_show_page(loader)
+            _BATTLE_PAGE_DONE[0] = True
+        except Exception:
+            _log('deferred showBattlePage failed:')
+            traceback.print_exc()
+        return
+    pending[1] = ticks_left - 1
+    try:
+        import BigWorld
+        BigWorld.callback(
+            0.1, lambda: _poll_pending_battle_page(orig_show_page))
+    except Exception:
+        _PENDING_BATTLE_PAGE[0] = None
+
+
 def _install_app_loader_patch():
     # The stock app-loader state machine only allows
     # Lobby -> BattleLoading -> Battle. Retail reaches
@@ -1697,31 +1812,57 @@ def _install_app_loader_patch():
 
     def _show_battle_loading(self):
         if _BATTLE_ACTIVE[0]:
+            if _BATTLE_PAGE_DONE[0]:
+                _log('appLoader.showBattleLoading swallowed '
+                     '(battle page already shown)')
+                _diag_flush()
+                return None
             _BATTLE_LOADING_SHOWN[0] = True
             _log('appLoader.showBattleLoading')
             _diag_flush()
         return orig_show_loading(self)
 
     def _show_battle_page(self):
-        if _BATTLE_ACTIVE[0]:
-            _log('appLoader.showBattlePage')
+        if not _BATTLE_ACTIVE[0]:
+            return orig_show_page(self)
+        _log('appLoader.showBattlePage')
+        _diag_flush()
+        if not _BATTLE_LOADING_SHOWN[0]:
+            _log('showBattlePage raced ahead of showBattleLoading'
+                 ' - entering battle loading state first')
             _diag_flush()
-            if not _BATTLE_LOADING_SHOWN[0]:
-                _log('showBattlePage raced ahead of showBattleLoading'
-                     ' - entering battle loading state first')
-                _diag_flush()
-                try:
-                    _show_battle_loading(self)
-                except Exception:
-                    _log('pre-emptive showBattleLoading failed:')
-                    traceback.print_exc()
-        return orig_show_page(self)
+            try:
+                _show_battle_loading(self)
+            except Exception:
+                _log('pre-emptive showBattleLoading failed:')
+                traceback.print_exc()
+        if _BATTLE_PAGE_POPULATED[0] or _BATTLE_PAGE_DONE[0]:
+            result = orig_show_page(self)
+            _BATTLE_PAGE_DONE[0] = True
+            return result
+        # Exiting BattleLoadingState in this same call stack loses
+        # the battle page: BattleLoadingState.showGUI only calls
+        # loadBattlePage once the SF battle app is INITIALIZED
+        # (the loader re-invokes showGUI while the state persists)
+        # and the BATTLE_LOADING toggle events are fire-and-forget,
+        # so a page that has not populated yet misses both. Retail
+        # spends seconds inside BattleLoadingState; stay there
+        # until the page exists (real-client test 2026-10-18 #11
+        # showed only the map, no HUD, no ESC menu).
+        if _PENDING_BATTLE_PAGE[0] is None:
+            _PENDING_BATTLE_PAGE[0] = [self, 50]
+            _log('showBattlePage deferred until battle page '
+                 'populates')
+            _diag_flush()
+            _poll_pending_battle_page(orig_show_page)
+        return None
 
     try:
         loader_cls.showBattleLoading = _show_battle_loading
         loader_cls.showBattlePage = _show_battle_page
         loader_cls._mpBattlePatched = True
         _log('app loader patch installed')
+        _ensure_battle_page_patch()
     except Exception:
         _log('app loader patch FAILED:')
         traceback.print_exc()
