@@ -41,7 +41,7 @@ import time
 import traceback
 import zlib
 
-_PREBATTLE_SECONDS = 10
+_PREBATTLE_SECONDS = 5
 _LOAD_TIMEOUT = 120.0
 _SAMPLE_PERIOD = 0.1
 _POSE_HEARTBEAT = 0.5
@@ -152,7 +152,6 @@ class _VehiclePose(object):
         self.attach_fails = 0
         self.grounded_once = False
         self.on_model_changed = None
-        self.filter_proxy = None
         # Kinematic parameters (filled from the type descriptor).
         self.speed_fwd = 12.0
         self.speed_back = 4.0
@@ -2120,39 +2119,21 @@ def _install_avatar_patch():
 
 
 class _VehicleFilterSyncProxy(object):
-    """Delegates a WGVehicleFilter except the retail-only sync calls
-    and - when a kinematic pose is attached - its matrix providers.
+    """Delegates a WGVehicleFilter except the retail-only sync calls.
 
     ``syncGunAngles``/``syncStabilisedYPR`` submit samples to the
     native interpolation filter a server-driven Vehicle has behind
     it; on a client-only Vehicle that native filter is null and the
     call crashes the client. Everything else delegates untouched.
-    The native filter matrices never move without a server stream,
-    but stock lifecycle code keeps re-reading them (camera binds on
-    control-mode switches, steady-calculator relinks, appearance
-    refreshes); serving the live pose providers here makes every
-    such rebind capture the moving tank instead of the spawn pose
-    (sniper orientation reset, real-client test #17).
+    Used strictly inside the scoped stock entry points (see
+    _FILTER_SCOPED): the appearance and native consumers must keep
+    seeing the real filter object.
     """
 
-    def __init__(self, vehicle_filter, pose=None):
+    def __init__(self, vehicle_filter):
         object.__setattr__(self, '_vehicle_filter', vehicle_filter)
-        object.__setattr__(self, '_pose', pose)
 
     def __getattr__(self, name):
-        try:
-            pose = object.__getattribute__(self, '_pose')
-        except AttributeError:
-            pose = None
-        if pose is not None:
-            if name in ('stabilisedMatrix', 'bodyMatrix',
-                        'groundPlacingMatrix',
-                        'groundPlacingMatrixFiltered'):
-                return pose.provider
-            if name == 'turretMatrix':
-                return pose.aim.turretMatrix
-            if name == 'gunMatrix':
-                return pose.aim.gunMatrix
         return getattr(object.__getattribute__(self, '_vehicle_filter'),
                        name)
 
@@ -2223,6 +2204,19 @@ _AVATAR_BOUND_VEHICLE = [None]
 # entity id -> _FakeServer bridge, for Vehicle base/cell routing
 # without depending on attribute storage on engine entities.
 _MP_VEHICLE_BRIDGES = {}
+
+
+def _pose_for_entity(entity_id):
+    """Kinematic pose registered for a battle entity id, or None."""
+    bridge = _MP_VEHICLE_BRIDGES.get(entity_id)
+    if bridge is None:
+        return None
+    try:
+        bc = bridge._bc
+        vid = bc._entity_vid.get(entity_id)
+        return bc._poses.get(vid) if vid else None
+    except Exception:
+        return None
 
 
 # Vehicle entities currently inside a stock call that must see the
@@ -2304,22 +2298,18 @@ def _install_vehicle_patch():
                 return orig_getattribute(self, '_mpFakeServer')
             except AttributeError:
                 pass
-        if name == 'filter':
-            pose = _pose_for(self)
-            if pose is not None:
-                # Always-on for battle vehicles (see the proxy
-                # docstring): one cached proxy per vehicle serves
-                # the live pose matrices and swallows the fatal
-                # sync calls for scoped and unscoped callers alike.
-                proxy = pose.filter_proxy
-                if proxy is None:
-                    proxy = _VehicleFilterSyncProxy(
-                        orig_getattribute(self, 'filter'), pose)
-                    pose.filter_proxy = proxy
-                return proxy
-            if _is_filter_scoped(self):
-                return _VehicleFilterSyncProxy(
-                    orig_getattribute(self, 'filter'))
+        if name == 'filter' and _is_filter_scoped(self):
+            # Scoped only: an always-on proxy (477e443) broke
+            # startVisual - the engine swaps the native filter
+            # object (DumbFilter -> WGVehicleFilter) after entity
+            # creation, so the appearance captured a proxy stuck
+            # delegating to a stale DumbFilter and died on the
+            # first WGVehicleFilter attribute (test #18).  Stock
+            # lifecycle rebinds that read filter matrices are
+            # corrected at their call sites instead (see
+            # _install_camera_bind_patch).
+            return _VehicleFilterSyncProxy(
+                orig_getattribute(self, 'filter'))
         return orig_getattribute(self, name)
 
     Vehicle.__getattribute__ = _vehicle_getattribute
@@ -2364,6 +2354,79 @@ def _install_vehicle_patch():
         Vehicle.set_gunAnglesPacked = _set_gun_angles_packed
 
     Vehicle._mpBattlePatched = True
+
+
+def _install_camera_bind_patch():
+    # Two stock rebind points read the native (dead) vehicle
+    # filter matrices: SteadyVehicleMatrixCalculator.relinkSources
+    # (input-handler start / siege changes - feeds the sniper and
+    # arcade aiming systems) and ConsistentMatrices'
+    # __linkOwnVehicle (own-vehicle camera matrix).  Wrap both:
+    # run the original, then re-point the specific providers at
+    # the live kinematic pose for our battle vehicles.
+    # Correcting synchronously inside the stock calls leaves no
+    # window where, e.g., the sniper aiming system computes its
+    # initial angles from the spawn pose (real-client test #17).
+    steady_cls = None
+    try:
+        from AvatarInputHandler.AimingSystems.steady_vehicle_matrix \
+            import SteadyVehicleMatrixCalculator as steady_cls
+    except Exception:
+        steady_cls = None
+    if steady_cls is not None and not getattr(
+            steady_cls, '_mpBattlePatched', False):
+        orig_relink = steady_cls.relinkSources
+
+        def _relink_sources(self):
+            orig_relink(self)
+            try:
+                import BigWorld
+                player = BigWorld.player()
+                vehicle = player.getVehicleAttached() \
+                    if player is not None else None
+                pose = _pose_for_entity(vehicle.id) \
+                    if vehicle is not None else None
+                if pose is not None:
+                    out = self.outputMProv
+                    out.rotationSrc = pose.provider
+                    out.translationSrc = pose.provider
+                    self.stabilisedMProv.target = pose.provider
+            except Exception:
+                _log('steady relink pose override failed:')
+                traceback.print_exc()
+
+        steady_cls.relinkSources = _relink_sources
+        steady_cls._mpBattlePatched = True
+
+    consistent_cls = None
+    try:
+        from AvatarPositionControl import \
+            ConsistentMatrices as consistent_cls
+    except Exception:
+        consistent_cls = None
+    if consistent_cls is not None and not getattr(
+            consistent_cls, '_mpBattlePatched', False):
+        orig_link = getattr(
+            consistent_cls, '_ConsistentMatrices__linkOwnVehicle',
+            None)
+        if orig_link is not None:
+            def _link_own_vehicle(self, vehicle):
+                orig_link(self, vehicle)
+                try:
+                    pose = _pose_for_entity(
+                        getattr(vehicle, 'id', None))
+                    if pose is not None:
+                        self.ownVehicleMatrix.target = pose.provider
+                except Exception:
+                    _log('linkOwnVehicle pose override failed:')
+                    traceback.print_exc()
+
+            consistent_cls._ConsistentMatrices__linkOwnVehicle = \
+                _link_own_vehicle
+            consistent_cls._mpBattlePatched = True
+
+    _log('camera bind patch: steady=%s consistent=%s'
+         % (steady_cls is not None, consistent_cls is not None))
 
 
 def _install_account_patch():
@@ -2858,6 +2921,7 @@ def install(state):
     state.battle = client
     _install_avatar_patch()
     _install_vehicle_patch()
+    _install_camera_bind_patch()
     _install_account_patch()
     _install_app_loader_patch()
     _install_diag_patches()

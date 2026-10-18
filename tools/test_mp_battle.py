@@ -482,32 +482,92 @@ _veh.filter.syncGunAngles(0.5, 0.25)
 check(_real_filter.synced == [(0.5, 0.25)],
       'real filter sync works again after scope')
 
-# always-on pose filter proxy: with a kinematic pose registered,
-# vehicle.filter serves the live pose matrices (stock lifecycle
-# rebinds must capture the moving tank) and swallows syncs even
-# outside the scoped sections.
+# Pose registration must NOT change what vehicle.filter returns:
+# appearance/native consumers need the real filter object (an
+# always-on proxy captured a stale DumbFilter and broke
+# startVisual - real-client test #18).  The pose reaches camera
+# consumers through the matrix overlay + targeted rebind wraps.
 _pose2 = _FakePose()
 _pose2.provider = 'POSE_PROVIDER'
-_pose2.aim = _ns(turretMatrix='TURRET_M', gunMatrix='GUN_M')
-_pose2.filter_proxy = None
 _pose2.x, _pose2.z = 11.0, 22.0
 bc._vehicles[777] = 90210
 bc._entity_vid[90210] = 777
 bc._poses[777] = _pose2
 BTL._MP_VEHICLE_BRIDGES[90210] = bc._bridge
 _veh.id = 90210
-check(_veh.filter.stabilisedMatrix == 'POSE_PROVIDER',
-      'filter proxy serves pose stabilisedMatrix')
-check(_veh.filter.turretMatrix == 'TURRET_M',
-      'filter proxy serves pose turretMatrix')
-check(_veh.filter.speedInfo == 'speed',
-      'filter proxy still delegates other attrs')
-check(_veh.filter is _veh.filter, 'filter proxy cached per pose')
-_veh.filter.syncGunAngles(3.0, 4.0)
-check(_real_filter.synced == [(0.5, 0.25)],
-      'unscoped syncs swallowed for battle vehicles')
+check(_veh.filter is _real_filter,
+      'filter stays native outside scope even with pose')
 check(_veh.matrix == 'POSE_PROVIDER',
       'matrix overlay serves pose provider')
+check(BTL._pose_for_entity(90210) is _pose2,
+      'pose lookup by entity id')
+check(BTL._pose_for_entity(424242) is None,
+      'pose lookup misses cleanly')
+
+# Camera bind wraps: the two stock relink points that read dead
+# filter matrices get re-pointed at the live pose, synchronously.
+_steady_mod = types.ModuleType(
+    'AvatarInputHandler.AimingSystems.steady_vehicle_matrix')
+
+
+class _FakeSteady(object):
+
+    def __init__(self):
+        self.outputMProv = _ns(rotationSrc='dead',
+                               translationSrc='dead')
+        self.stabilisedMProv = _ns(target='dead')
+        self.relinked = False
+
+    def relinkSources(self):
+        self.relinked = True
+
+
+_steady_mod.SteadyVehicleMatrixCalculator = _FakeSteady
+sys.modules.setdefault('AvatarInputHandler',
+                       types.ModuleType('AvatarInputHandler'))
+sys.modules.setdefault('AvatarInputHandler.AimingSystems',
+                       types.ModuleType(
+                           'AvatarInputHandler.AimingSystems'))
+sys.modules['AvatarInputHandler.AimingSystems.'
+            'steady_vehicle_matrix'] = _steady_mod
+_apc_mod = types.ModuleType('AvatarPositionControl')
+
+
+class _FakeConsistent2(object):
+
+    def __init__(self):
+        self.ownVehicleMatrix = _ns(target='dead')
+        self.linked = None
+
+    def _ConsistentMatrices__linkOwnVehicle(self, vehicle):
+        self.linked = vehicle
+
+
+_apc_mod.ConsistentMatrices = _FakeConsistent2
+sys.modules['AvatarPositionControl'] = _apc_mod
+_had_player = hasattr(BW, 'player')
+_old_player = getattr(BW, 'player', None)
+BW.player = lambda *a: _ns(getVehicleAttached=lambda: _ns(id=90210))
+BTL._install_camera_bind_patch()
+_steady = _FakeSteady()
+_steady.relinkSources()
+check(_steady.relinked and
+      _steady.outputMProv.rotationSrc == 'POSE_PROVIDER' and
+      _steady.outputMProv.translationSrc == 'POSE_PROVIDER' and
+      _steady.stabilisedMProv.target == 'POSE_PROVIDER',
+      'steady relink re-pointed at pose provider')
+_cons = _FakeConsistent2()
+_cons._ConsistentMatrices__linkOwnVehicle(_ns(id=90210))
+check(_cons.ownVehicleMatrix.target == 'POSE_PROVIDER',
+      'linkOwnVehicle re-pointed at pose provider')
+_cons2 = _FakeConsistent2()
+_cons2._ConsistentMatrices__linkOwnVehicle(_ns(id=424242))
+check(_cons2.ownVehicleMatrix.target == 'dead',
+      'linkOwnVehicle untouched for non-battle vehicles')
+if _had_player:
+    BW.player = _old_player
+elif hasattr(BW, 'player'):
+    del BW.player
 
 # arena positions feed: indices are ranks in sorted entity-id
 # order, exactly like ClientArena.__rebuildIndexToId.
