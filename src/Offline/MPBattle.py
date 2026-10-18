@@ -1332,9 +1332,11 @@ class _VehicleFilterSyncProxy(object):
                 name, value)
 
     def syncGunAngles(self, yaw, pitch):
+        _log('filter proxy: syncGunAngles swallowed')
         return None
 
     def syncStabilisedYPR(self, yaw, pitch, roll):
+        _log('filter proxy: syncStabilisedYPR swallowed')
         return None
 
 
@@ -1551,6 +1553,45 @@ def _install_diag_patches():
         from AvatarInputHandler.control_modes import ArcadeControlMode
         _diag_wrap(ArcadeControlMode, 'enable',
                    'ArcadeControlMode.enable')
+    except Exception:
+        pass
+    # Inside Vehicle.startVisual: the client died natively somewhere
+    # in the appearance chain, so breadcrumb its stages.
+    try:
+        from Vehicle import Vehicle as _DiagVehicle
+        _diag_wrap(_DiagVehicle, 'show', 'Vehicle.show')
+        _diag_wrap(_DiagVehicle, 'set_publicStateModifiers',
+                   'Vehicle.set_publicStateModifiers')
+        _diag_wrap(_DiagVehicle, 'set_damageStickers',
+                   'Vehicle.set_damageStickers')
+    except Exception:
+        pass
+    try:
+        from vehicle_systems.CompoundAppearance import CompoundAppearance
+        for _method in ('setVehicle', 'activate', 'changeEngineMode',
+                        'onVehicleHealthChanged', 'setupGunMatrixTargets',
+                        'start'):
+            _diag_wrap(CompoundAppearance, _method,
+                       'CompoundAppearance.' + _method)
+    except Exception:
+        pass
+    try:
+        from vehicle_systems import appearance_cache
+        _orig_get_appearance = appearance_cache.getAppearance
+        if not getattr(_orig_get_appearance, '_mpBattleDiag', False):
+            def _get_appearance(vId, resourceRefs,
+                                _orig=_orig_get_appearance):
+                _log('>> appearance_cache.getAppearance id=%s refs=%s'
+                     % (vId, len(resourceRefs)
+                        if resourceRefs is not None else None))
+                try:
+                    return _orig(vId, resourceRefs)
+                finally:
+                    _log('<< appearance_cache.getAppearance id=%s'
+                         % (vId,))
+
+            _get_appearance._mpBattleDiag = True
+            appearance_cache.getAppearance = _get_appearance
     except Exception:
         pass
 
