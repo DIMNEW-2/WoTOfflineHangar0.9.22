@@ -629,15 +629,29 @@ _acc.onBecomePlayer()
 check(_acc.became_player is True and not _bw_clear_calls,
       'account onBecomePlayer runs without clearAllSpaces')
 check(_acc.arena is None and _acc.positionControl is None
-      and _acc.inputHandler is None and _acc.observedVehicleID == 0,
+      and _acc.inputHandler is None and _acc.gunRotator is None
+      and _acc.vehicle is None and _acc.observedVehicleID == 0,
       'account teardown sentinels served')
 try:
     _probe = _acc.consistentMatrices.onVehicleMatrixBindingChanged
     _probe -= _acc.onBecomePlayer
+    _acc.onVehicleLeaveWorld -= _acc.onBecomePlayer
     _sentinel_ok = True
 except Exception:
     _sentinel_ok = False
 check(_sentinel_ok, 'account consistentMatrices dummy event works')
+try:
+    _da = BTL._DUMMY_ARENA
+    _da.onPeriodChange -= _acc.onBecomePlayer
+    _da.onVehicleKilled += _acc.onBecomePlayer
+    _da.vehicles.itervalues()
+    _dummy_ok = (list(_da.vehicles) == [] and len(_da.vehicles) == 0
+                 and _da.get('x', 'dflt') == 'dflt'
+                 and bool(_da) is True
+                 and _da.period is _da)
+except Exception:
+    _dummy_ok = False
+check(_dummy_ok, 'dummy arena black hole absorbs teardown reads')
 BW.clearAllSpaces()
 check(_bw_clear_calls == [True], 'clearAllSpaces restored after wrapper')
 
@@ -762,8 +776,12 @@ check('player' in _names and 'destroy' in _names
 check(_bw_order[_names.index('player')][1] is _fake_account,
       'teardown promotes the hangar Account')
 check(not client3.active, 'client inactive after teardown')
+check(getattr(_fake_account, 'arena', None) is BTL._DUMMY_ARENA,
+      'teardown arms dummy arena on Account')
 check(len(_bw_callbacks) > _cb_before, 'lobby restore scheduled')
 _bw_callbacks[-1][1]()
+check(_fake_account.arena is None,
+      'lobby restore disarms dummy arena')
 check(_fake_account.gui_ctx == {'databaseID': 1, 'currentVehInvID': 1},
       'lobby restore calls Account.showGUI with databaseID=1')
 

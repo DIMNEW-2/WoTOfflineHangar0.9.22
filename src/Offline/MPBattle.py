@@ -1894,6 +1894,16 @@ class _BattleClient(object):
         account = getattr(self.state, 'player', None)
         was_promoted = self._promoted
         if account is not None and was_promoted:
+            # Arm the black-hole arena for the teardown window:
+            # stock onBecomeNonPlayer reads player().arena.<event>
+            # unguarded once player() is the Account, and the
+            # class-level None sentinel is not enough there
+            # ('NoneType' has no 'onPeriodChange', test #21).
+            # _restore_lobby disarms it back to None.
+            try:
+                account.arena = _DUMMY_ARENA
+            except Exception:
+                pass
             try:
                 BigWorld.player(account)
             except Exception:
@@ -1971,6 +1981,12 @@ class _BattleClient(object):
         account = getattr(self.state, 'player', None)
         if account is None:
             return
+        # Disarm the teardown-window dummy arena (see _teardown):
+        # hangar code must go back to seeing arena=None.
+        try:
+            account.arena = None
+        except Exception:
+            pass
         import BigWorld
         import cPickle
         try:
@@ -2307,6 +2323,53 @@ _MP_VEHICLE_BRIDGES = {}
 _RETIRED_POSES = []
 
 
+class _DummyArena(object):
+    """Black-hole stand-in for ClientArena, armed on the hangar
+    Account only for the duration of battle teardown.
+
+    The demoted Avatar's onBecomeNonPlayer destroys the battle
+    GUI while BigWorld.player() already returns the Account,
+    and several stock teardown paths read player().arena.<event>
+    with no None guard (PostMortemControlMode.__disconnectFrom-
+    Arena, AvatarInputHandler.stop).  Every attribute resolves
+    to the black hole itself: event -=/+=, calls, iteration and
+    mapping access all absorb harmlessly.  Removed again by
+    _restore_lobby so hangar code keeps seeing arena=None."""
+
+    def __getattr__(self, name):
+        return self
+
+    def __call__(self, *args, **kwargs):
+        return self
+
+    def __iadd__(self, handler):
+        return self
+
+    def __isub__(self, handler):
+        return self
+
+    def __iter__(self):
+        return iter(())
+
+    def __len__(self):
+        return 0
+
+    def __nonzero__(self):
+        return True
+
+    def __getitem__(self, key):
+        return self
+
+    def __contains__(self, key):
+        return False
+
+    def get(self, key, default=None):
+        return default
+
+
+_DUMMY_ARENA = _DummyArena()
+
+
 def _pose_for_entity(entity_id):
     """Kinematic pose registered for a battle entity id, or None."""
     bridge = _MP_VEHICLE_BRIDGES.get(entity_id)
@@ -2568,7 +2631,10 @@ def _install_account_patch():
         'arena': None,
         'positionControl': None,
         'inputHandler': None,
+        'gunRotator': None,
+        'vehicle': None,
         'observedVehicleID': 0,
+        'onVehicleLeaveWorld': _DummyEvent(),
         'consistentMatrices': _DummyMatrices(),
     }
     for _name, _value in _teardown_sentinels.iteritems():
