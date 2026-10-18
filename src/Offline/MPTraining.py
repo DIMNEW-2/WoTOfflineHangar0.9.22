@@ -1007,10 +1007,22 @@ class _TrainingClient(object):
         self._notify_invites_changed()
 
     def _notify_invites_changed(self):
+        # IMPORTANT: mirror the real BW point-update diff. The stock
+        # InvitesManager only raises onReceivedInviteListModified (the
+        # popup notification / unread counter) when the diff contains
+        # the plain 'prebattleInvites' key (Account.__synchronizeCacheDict
+        # 'update' mode). A ('prebattleInvites', '_r') full-replace diff
+        # only rebuilds the list silently -- no popup is ever shown.
+        invites = {}
+        try:
+            invites = dict(getattr(self.state.player,
+                                   'prebattleInvites', {}) or {})
+        except Exception:
+            invites = {}
         try:
             from PlayerEvents import g_playerEvents
             g_playerEvents.onPrebattleInvitesChanged(
-                {('prebattleInvites', '_r'): True})
+                {'prebattleInvites': invites})
         except Exception:
             pass
 

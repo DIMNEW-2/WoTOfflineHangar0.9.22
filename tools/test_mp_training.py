@@ -565,6 +565,13 @@ check(rec is not None and rec['state'] == C.PREBATTLE_INVITE_STATE.ACTIVE
       'invite stored in player.prebattleInvites (old-style cache)')
 check(pe_mod.g_playerEvents.onPrebattleInvitesChanged.calls,
       'onPrebattleInvitesChanged fired')
+_diff = pe_mod.g_playerEvents.onPrebattleInvitesChanged.calls[-1][0]
+# Stock InvitesManager only pops up the notification for point updates
+# (plain 'prebattleInvites' key); a '_r' full-replace diff is silent
+# (real-client bug: "invitation notification never arrives").
+check('prebattleInvites' in _diff and
+      ('prebattleInvites', '_r') not in _diff,
+      'invite diff is a point update (notification popup path)')
 
 client.on_msg({'t': 'prb', 'ev': 'sysNote', 'text': u'hello note'})
 check(_gui_notes and _gui_notes[-1] == u'hello note',
