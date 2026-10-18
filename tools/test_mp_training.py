@@ -74,8 +74,29 @@ class PlayerAccount(object):
         raise AssertionError('stock stub must be patched')
 
 
+PlayerAccount.onBecomePlayer = lambda self: None
 account_mod.PlayerAccount = PlayerAccount
 sys.modules['Account'] = account_mod
+
+# Avatar/Vehicle entity stubs (MPBattle.install patches their classes)
+avatar_mod = types.ModuleType('Avatar')
+
+
+class _PlayerAvatar(object):
+    pass
+
+
+avatar_mod.PlayerAvatar = _PlayerAvatar
+sys.modules['Avatar'] = avatar_mod
+vehicle_ent_mod = types.ModuleType('Vehicle')
+
+
+class _VehicleEnt(object):
+    pass
+
+
+vehicle_ent_mod.Vehicle = _VehicleEnt
+sys.modules['Vehicle'] = vehicle_ent_mod
 
 
 class _Event(object):
@@ -109,12 +130,16 @@ sys.modules['gui'] = gui_mod
 # --- load modules under test --------------------------------------------------
 MP = imp.load_source('MPChat', os.path.join(ROOT, 'src', 'Offline', 'MPChat.py'))
 TRN = imp.load_source('MPTraining', os.path.join(ROOT, 'src', 'Offline', 'MPTraining.py'))
+BTL = imp.load_source('MPBattle', os.path.join(ROOT, 'src', 'Offline', 'MPBattle.py'))
 _pkg = types.ModuleType('Offline')
 _pkg.MPChat = MP
 _pkg.MPTraining = TRN
+_pkg.MPBattle = BTL
 sys.modules['Offline'] = _pkg
 sys.modules['Offline.MPChat'] = MP
 sys.modules['Offline.MPTraining'] = TRN
+sys.modules['Offline.MPBattle'] = BTL
+sys.modules['MPBattle'] = BTL
 
 FAILS = []
 
@@ -325,24 +350,40 @@ check(upds(a_in, C.PREBATTLE_UPDATE.TEAM_STATES) == [[1, 1]]
 del a_in[:]
 del b_in[:]
 
-# both teams ready -> battle refused after deferred tick
+# both teams ready -> battle starts after deferred tick (MPBattle)
 prb(srv, alice, cmd='teamReady', req=19, team=1)
 del a_in[:]
 del b_in[:]
 prb(srv, alice, cmd='teamReady', req=20, team=2)
 check(upds(b_in, C.PREBATTLE_UPDATE.TEAM_STATES) == [[2, 2]],
       'team2 READY broadcast')
-check(len(trn._deferred) == 1, 'battle cancel deferred scheduled')
+check(len(trn._deferred) == 1, 'battle start deferred scheduled')
 trn._deferred[0] = (0.0, trn._deferred[0][1], trn._deferred[0][2])
 del a_in[:]
 del b_in[:]
 trn.on_tick()
+
+
+def _btl(inbox, ev):
+    return [m for m in inbox if m.get('t') == 'btl' and m.get('ev') == ev]
+
+
+_start_a = _btl(a_in, 'start')
+_start_b = _btl(b_in, 'start')
+check(_start_a and _start_b, 'battle start sent to assigned players')
+check(_start_a and _start_a[0]['arenaTypeID'] == 7
+      and sorted(p['team'] for p in _start_a[0]['players']) == [1, 2],
+      'battle start carries arena and both-team roster')
+check(not upds(a_in, C.PREBATTLE_UPDATE.TEAM_STATES),
+      'teams stay READY while the battle runs')
+del a_in[:]
+del b_in[:]
+# both players leave the battle -> room ready states reset
+trn.battle.on_msg(alice, {'t': 'btl', 'cmd': 'leave'})
+trn.battle.on_msg(bob, {'t': 'btl', 'cmd': 'leave'})
 check(upds(a_in, C.PREBATTLE_UPDATE.TEAM_STATES) == [[1, 1]]
       and upds(b_in, C.PREBATTLE_UPDATE.TEAM_STATES) == [[1, 1]],
-      'both teams reverted to NOT_READY')
-check(evs(a_in, 'sysNote') and evs(b_in, 'sysNote')
-      and u'недоступен' in evs(a_in, 'sysNote')[0]['text'],
-      'battle-unavailable note to all members')
+      'ready states reset after the battle')
 del a_in[:]
 del b_in[:]
 

@@ -1082,10 +1082,26 @@ def init_offline():
                     p = _LAST_PLAYER_ACCOUNT[0]
                     print '[OFFLINE] BigWorld.player() was None right after createEntity, using captured instance instead'
 
-                def _fake_bw_player():
+                # [MPBattle] Keep the ORIGINAL BigWorld.player accessible:
+                # entering a battle needs the real engine promotion
+                # BigWorld.player(avatar). The patched getter returns the
+                # captured Account in the hangar (legacy behaviour) and
+                # whatever entity was last promoted through the setter
+                # while a battle runs. Offline.MPBattle reads the control
+                # block from BigWorld._offline_player_control.
+                _BW_ORIGINAL_PLAYER = [BigWorld.player]
+                _BW_PLAYER_OVERRIDE = [None]
+
+                def _fake_bw_player(entity=None):
+                    if entity is not None:
+                        _BW_PLAYER_OVERRIDE[0] = entity
+                        return _BW_ORIGINAL_PLAYER[0](entity)
+                    if _BW_PLAYER_OVERRIDE[0] is not None:
+                        return _BW_PLAYER_OVERRIDE[0]
                     return _LAST_PLAYER_ACCOUNT[0]
 
                 BigWorld.player = _fake_bw_player
+                BigWorld._offline_player_control = (_BW_ORIGINAL_PLAYER, _BW_PLAYER_OVERRIDE)
                 print '[OFFLINE] BigWorld.player patched OK (always returns captured PlayerAccount)'
                 import Account as _Acct2
                 try:

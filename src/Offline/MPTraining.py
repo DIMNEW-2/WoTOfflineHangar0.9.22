@@ -17,10 +17,11 @@ WoT 0.9.21 between clients connected to the same local host:
   * team ready states, invites (old-style ``player.prebattleInvites``)
     and a per-room stock prebattle chat channel.
 
-Battle launch is intentionally NOT implemented (matches the offline
-hangar scope): when both teams are set ready, the host reverts both team
-states to NOT_READY and pushes a stock system message explaining that
-battles are unavailable in local multiplayer.
+Battle launch is delegated to Offline.MPBattle: when both teams are set
+ready, the host starts a local battle for the assigned players (stock
+battle GUI/physics, input replication over the LAN).  If the battle
+module is unavailable or refuses (e.g. no arena chosen), the host falls
+back to reverting both team states with a stock system message.
 
 Nothing here invents GUI: every client-side patch only replaces the
 network methods of ``PlayerAccount`` (``prb_*`` / ``requestPrebattles*``),
@@ -163,6 +164,7 @@ class _TrainingServer(object):
         self.invites = {}  # (target_vid, room_id) -> dict
         self.next_id = 1
         self._deferred = []
+        self.battle = None  # Offline.MPBattle server, attached by make_server
 
     # -- plumbing ---------------------------------------------------------
 
@@ -360,6 +362,12 @@ class _TrainingServer(object):
         return True
 
     def _destroy_room(self, room, reason):
+        if self.battle is not None:
+            try:
+                self.battle.on_room_destroyed(room)
+            except Exception:
+                _log('battle room-destroyed handling failed:')
+                traceback.print_exc()
         member_vids = list(room.members)
         room.members.clear()
         for vid in member_vids:
@@ -514,6 +522,34 @@ class _TrainingServer(object):
                       lambda c, n=name, v=value: [n, v])
         self._resp(conn, msg, ok)
 
+    def _schedule_battle_start(self, room):
+        key = ('battle-start', room.room_id)
+        self._deferred = [entry for entry in self._deferred
+                          if entry[1] != key]
+        self._deferred.append((time.time() + _BATTLE_CANCEL_DELAY, key,
+                               lambda r=room: self._begin_battle(r)))
+
+    def _drop_battle_start(self, room):
+        key = ('battle-start', room.room_id)
+        self._deferred = [entry for entry in self._deferred
+                          if entry[1] != key]
+
+    def _begin_battle(self, room):
+        if room.room_id not in self.rooms:
+            return
+        started = False
+        if self.battle is not None:
+            try:
+                started = self.battle.start(room)
+            except Exception:
+                _log('battle start failed:')
+                traceback.print_exc()
+                started = False
+        if not started:
+            _log('room #%s: battle could not start, reverting ready states'
+                 % (room.room_id,))
+            self._cancel_battle(room)
+
     def _schedule_battle_cancel(self, room, delay):
         key = ('battle-cancel', room.room_id)
         self._deferred = [entry for entry in self._deferred
@@ -552,7 +588,8 @@ class _TrainingServer(object):
             states = self._team_states(room)
             if states[0] == C.PREBATTLE_TEAM_STATE.READY \
                     and states[1] == C.PREBATTLE_TEAM_STATE.READY:
-                self._schedule_battle_cancel(room, _BATTLE_CANCEL_DELAY)
+                self._drop_battle_cancel(room)
+                self._schedule_battle_start(room)
             else:
                 self._schedule_battle_cancel(room, _TEAM_READY_TIMEOUT)
         self._resp(conn, msg, ok)
@@ -566,6 +603,7 @@ class _TrainingServer(object):
         if ok:
             room.team_states[team] = C.PREBATTLE_TEAM_STATE.NOT_READY
             self._broadcast_team_states(room)
+            self._drop_battle_start(room)
             if C.PREBATTLE_TEAM_STATE.READY not in self._team_states(room):
                 self._drop_battle_cancel(room)
         self._resp(conn, msg, ok)
@@ -744,12 +782,28 @@ class _TrainingServer(object):
             return
         handler(conn, msg)
 
+    def on_btl_msg(self, conn, msg):
+        if self.battle is not None:
+            self.battle.on_msg(conn, msg)
+
     def on_disconnect(self, conn):
+        if self.battle is not None:
+            try:
+                self.battle.on_disconnect(conn)
+            except Exception:
+                _log('battle disconnect handling failed:')
+                traceback.print_exc()
         if conn.vid in self.by_vid:
             self._leave(conn)
             _log('%s disconnected from room' % (conn.nick,))
 
     def on_tick(self):
+        if self.battle is not None:
+            try:
+                self.battle.on_tick()
+            except Exception:
+                _log('battle tick failed:')
+                traceback.print_exc()
         now = time.time()
         due = [entry for entry in self._deferred if entry[0] <= now]
         if not due:
@@ -765,7 +819,18 @@ class _TrainingServer(object):
 
 
 def make_server(mp_server):
-    return _TrainingServer(mp_server)
+    server = _TrainingServer(mp_server)
+    try:
+        try:
+            from Offline import MPBattle
+        except ImportError:
+            import MPBattle
+        server.battle = MPBattle.make_server(server)
+        _log('battle server attached')
+    except Exception:
+        _log('battle server attach failed (battles unavailable):')
+        traceback.print_exc()
+    return server
 
 
 # ---------------------------------------------------------------------------
@@ -1124,4 +1189,13 @@ def install(state):
     _bind('requestPrebattlesByName', client.op_request_list_by_name)
     _bind('requestPrebattleRoster', client.op_request_roster)
     _log('training rooms client patches installed')
+    try:
+        try:
+            from Offline import MPBattle
+        except ImportError:
+            import MPBattle
+        MPBattle.install(state)
+    except Exception:
+        _log('battle client install failed (battles unavailable):')
+        traceback.print_exc()
     return client

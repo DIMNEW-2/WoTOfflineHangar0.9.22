@@ -958,6 +958,13 @@ class _MPServer(object):
             _log('training (prb) message handling failed:')
             traceback.print_exc()
 
+    def on_btl_msg(self, conn, msg):
+        try:
+            self._training_server().on_btl_msg(conn, msg)
+        except Exception:
+            _log('battle (btl) message handling failed:')
+            traceback.print_exc()
+
     def on_prb_disconnect(self, conn):
         training = getattr(self, 'training', None)
         if training is not None:
@@ -1278,6 +1285,8 @@ class _Transport(object):
             return
         elif mtype == 'prb':
             self.server.on_prb_msg(conn, msg)
+        elif mtype == 'btl':
+            self.server.on_btl_msg(conn, msg)
         elif mtype == 'cmd':
             self.server.on_cmd(conn, msg.get('req', -1), msg.get('cmd', -1),
                                msg.get('chan', 0), msg.get('i64', 0),
@@ -1392,11 +1401,26 @@ class _ClientState(object):
                 except Exception:
                     _log('training (prb) client message failed:')
                     traceback.print_exc()
+        elif mtype == 'btl':
+            battle = getattr(self, 'battle', None)
+            if battle is not None:
+                try:
+                    battle.on_msg(msg)
+                except Exception:
+                    _log('battle (btl) client message failed:')
+                    traceback.print_exc()
         elif mtype == 'chat2find':
             self._deliver_chat2_find(msg.get('req', 0), msg.get('users') or [])
         elif mtype == '_disconnected':
             self.my_vid = 0
             self.pending_acts = []
+            battle = getattr(self, 'battle', None)
+            if battle is not None:
+                try:
+                    battle.on_disconnected()
+                except Exception:
+                    _log('battle disconnect handling failed:')
+                    traceback.print_exc()
 
     def _self_dbid(self):
         try:

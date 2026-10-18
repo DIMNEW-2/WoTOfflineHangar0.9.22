@@ -557,5 +557,37 @@ rep("""                    from Offline import NewYearServer as _NYS_init
                         traceback.print_exc()""",
 '19-mpchat-init')
 
+# ------------------------------------------------- MPBattle player() hook
+# The stock fake makes BigWorld.player() always return the captured
+# Account. Battles (Offline.MPBattle) need the REAL engine promotion
+# BigWorld.player(avatar) plus a getter that returns the Avatar while a
+# battle runs. Keep the original function and an override cell in
+# BigWorld._offline_player_control; hangar behaviour is unchanged.
+rep("""                def _fake_bw_player():
+                    return _LAST_PLAYER_ACCOUNT[0]
+
+                BigWorld.player = _fake_bw_player""",
+"""                # [MPBattle] Keep the ORIGINAL BigWorld.player accessible:
+                # entering a battle needs the real engine promotion
+                # BigWorld.player(avatar). The patched getter returns the
+                # captured Account in the hangar (legacy behaviour) and
+                # whatever entity was last promoted through the setter
+                # while a battle runs. Offline.MPBattle reads the control
+                # block from BigWorld._offline_player_control.
+                _BW_ORIGINAL_PLAYER = [BigWorld.player]
+                _BW_PLAYER_OVERRIDE = [None]
+
+                def _fake_bw_player(entity=None):
+                    if entity is not None:
+                        _BW_PLAYER_OVERRIDE[0] = entity
+                        return _BW_ORIGINAL_PLAYER[0](entity)
+                    if _BW_PLAYER_OVERRIDE[0] is not None:
+                        return _BW_PLAYER_OVERRIDE[0]
+                    return _LAST_PLAYER_ACCOUNT[0]
+
+                BigWorld.player = _fake_bw_player
+                BigWorld._offline_player_control = (_BW_ORIGINAL_PLAYER, _BW_PLAYER_OVERRIDE)""",
+'20-mpbattle-player-dispatch')
+
 open(path, 'w').write(src)
 print('ALL PORT EDITS APPLIED')
