@@ -1331,12 +1331,20 @@ class _VehicleFilterSyncProxy(object):
         setattr(object.__getattribute__(self, '_vehicle_filter'),
                 name, value)
 
+    _logged = [0]
+
     def syncGunAngles(self, yaw, pitch):
-        _log('filter proxy: syncGunAngles swallowed')
+        if _VehicleFilterSyncProxy._logged[0] < 3:
+            _VehicleFilterSyncProxy._logged[0] += 1
+            _log('filter proxy: syncGunAngles swallowed')
+            _diag_flush()
         return None
 
     def syncStabilisedYPR(self, yaw, pitch, roll):
-        _log('filter proxy: syncStabilisedYPR swallowed')
+        if _VehicleFilterSyncProxy._logged[0] < 3:
+            _VehicleFilterSyncProxy._logged[0] += 1
+            _log('filter proxy: syncStabilisedYPR swallowed')
+            _diag_flush()
         return None
 
 
@@ -1397,11 +1405,17 @@ def _install_vehicle_patch():
         def _start_wg_physics(self):
             if not _is_mp_vehicle(self):
                 return orig_start_physics(self)
+            _log('>> __startWGPhysics id=%s (filter proxy scoped)'
+                 % (getattr(self, 'id', None),))
+            _diag_flush()
             _FILTER_SCOPED.append(self)
             try:
                 return orig_start_physics(self)
             finally:
                 _remove_scoped(self)
+                _log('<< __startWGPhysics id=%s'
+                     % (getattr(self, 'id', None),))
+                _diag_flush()
 
         Vehicle._Vehicle__startWGPhysics = _start_wg_physics
 
@@ -1496,14 +1510,33 @@ def _diag_wrap(cls, attr_name, label):
 
     def _wrapped(self, *args, **kwargs):
         _log('>> %s' % (label,))
+        _diag_flush()
         try:
             return orig(self, *args, **kwargs)
         finally:
             _log('<< %s' % (label,))
+            _diag_flush()
 
     _wrapped._mpBattleDiag = True
     try:
         setattr(cls, attr_name, _wrapped)
+    except Exception:
+        pass
+
+
+def _diag_flush():
+    # python.log is force-flushed only once a second by
+    # Offline.Manager; a native death could eat the last breadcrumb.
+    try:
+        import sys
+        sys.stdout.flush()
+    except Exception:
+        pass
+    try:
+        import BigWorld
+        flush = getattr(BigWorld, 'flushLog', None)
+        if callable(flush):
+            flush()
     except Exception:
         pass
 
@@ -1533,6 +1566,7 @@ def _install_diag_patches():
                 _log('>> Vehicle.startVisual id=%s player=%s'
                      % (getattr(self, 'id', None),
                         getattr(self, 'isPlayerVehicle', None)))
+                _diag_flush()
                 try:
                     return _orig(self)
                 finally:
