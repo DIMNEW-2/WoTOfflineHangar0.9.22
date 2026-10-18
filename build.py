@@ -25,6 +25,7 @@ FILES = [
     'Offline/Manager.py',
     'Offline/NewYearServer.py',
     'Offline/MPChat.py',
+    'Offline/MPTraining.py',
     'gui/Scaleform/daapi/view/login/LoginView.py',
 ]
 

@@ -100,6 +100,23 @@ def _cs():
     return chat_shared
 
 
+def current_veh_descr():
+    """Compact descriptor of the currently selected vehicle (0 if unknown).
+
+    Prebattle rosters carry vehCompDescr, but the stock client only sends
+    the inventory ID to the server - the LAN layer attaches the descriptor
+    explicitly so remote hangars can show the right tank.
+    """
+    try:
+        from CurrentVehicle import g_currentVehicle
+        item = g_currentVehicle.item
+        if item is not None:
+            return int(item.intCD)
+    except Exception:
+        pass
+    return 0
+
+
 def _sanitize_nick(nick):
     nick = _u(nick).strip()
     cleaned = u''
@@ -178,7 +195,7 @@ def _load_config():
 
 class _Conn(object):
     __slots__ = ('key', 'send', 'vid', 'nick', 'self_dbid', 'joined',
-     'friends', 'ignored', 'muted', 'alive')
+     'friends', 'ignored', 'muted', 'alive', 'entity_id', 'veh_descr')
 
     def __init__(self, key, send):
         self.key = key
@@ -191,6 +208,10 @@ class _Conn(object):
         self.ignored = set()
         self.muted = set()
         self.alive = True
+        # For prebattle rosters (MPTraining): the client's local player
+        # entity ID (self-recognition in rosters) and current vehicle.
+        self.entity_id = 0
+        self.veh_descr = 0
 
 
 class _Chan(object):
@@ -302,8 +323,8 @@ class _MPServer(object):
         cs = _cs()
         channels = []
         for chan in self.channels.itervalues():
-            if chan.system or chan.flags & cs.CHAT_CHANNEL_PRIVATE:
-                continue  # privates keep only their history (by vid pair)
+            if chan.system or chan.flags & cs.CHAT_CHANNEL_PRIVATE or chan.flags & cs.CHAT_CHANNEL_PREBATTLE:
+                continue  # privates keep only history; prb channels are session-local
             channels.append({'id': chan.id,
              'name': chan.name,
              'owner': chan.owner,
@@ -372,6 +393,7 @@ class _MPServer(object):
             return
         conn.alive = False
         if conn.vid:
+            self.on_prb_disconnect(conn)
             self._snapshot_roster(conn)
             self.by_vid.pop(conn.vid, None)
             for cid in list(conn.joined):
@@ -391,8 +413,16 @@ class _MPServer(object):
                 self._act(other, cs.CHAT_ACTIONS.friendStatusUpdate,
                           data=[[self._view_id(conn.vid, other), bool(online)]])
 
-    def on_hello(self, conn, nick, self_dbid):
+    def on_hello(self, conn, nick, self_dbid, entity_id=0, veh_descr=0):
         cs = _cs()
+        try:
+            conn.entity_id = int(entity_id)
+        except Exception:
+            conn.entity_id = 0
+        try:
+            conn.veh_descr = int(veh_descr)
+        except Exception:
+            conn.veh_descr = 0
         base = _sanitize_nick(nick) or u'Commander'
         taken = set((c.nick.lower() for c in self.by_vid.itervalues()))
         candidate = base
@@ -621,7 +651,7 @@ class _MPServer(object):
             token = s1.lower()
             found = []
             for chan in self.channels.itervalues():
-                if chan.flags & cs.CHAT_CHANNEL_PRIVATE:
+                if chan.flags & cs.CHAT_CHANNEL_PRIVATE or chan.flags & cs.CHAT_CHANNEL_PREBATTLE:
                     continue
                 if not token or token in chan.name.lower():
                     found.append(self._chan_data(chan, conn))
@@ -901,6 +931,53 @@ class _MPServer(object):
                 break
         conn.send({'t': 'chat2find', 'req': req, 'users': users})
 
+    def new_channel(self, name, owner_vid, flags):
+        """Create and register a channel (used by MPTraining room chats)."""
+        chan = _Chan(self.next_cid, name, owner=owner_vid)
+        chan.flags = flags
+        self.channels[chan.id] = chan
+        self.next_cid += 1
+        return chan
+
+    # -- training rooms (delegated to Offline.MPTraining) -------------------
+
+    def _training_server(self):
+        training = getattr(self, 'training', None)
+        if training is None:
+            try:
+                from Offline import MPTraining
+            except ImportError:
+                import MPTraining
+            training = MPTraining.make_server(self)
+            self.training = training
+        return training
+
+    def on_prb_msg(self, conn, msg):
+        try:
+            self._training_server().on_msg(conn, msg)
+        except Exception:
+            _log('training (prb) message handling failed:')
+            traceback.print_exc()
+
+    def on_prb_disconnect(self, conn):
+        training = getattr(self, 'training', None)
+        if training is not None:
+            try:
+                training.on_disconnect(conn)
+            except Exception:
+                _log('training disconnect handling failed:')
+                traceback.print_exc()
+
+    def on_tick(self):
+        self.flush_state()
+        training = getattr(self, 'training', None)
+        if training is not None:
+            try:
+                training.on_tick()
+            except Exception:
+                _log('training tick failed:')
+                traceback.print_exc()
+
 
 # ---------------------------------------------------------------------------
 # Transport (non-blocking sockets polled from the BigWorld callback loop)
@@ -1068,7 +1145,7 @@ class _Transport(object):
         if self.state == 'off':
             return
         if self.server is not None:
-            self.server.flush_state()
+            self.server.on_tick()
         now = time.time()
         rlist = []
         if self.udp_sock is not None:
@@ -1196,9 +1273,12 @@ class _Transport(object):
             return
         mtype = msg.get('t')
         if mtype == 'hello':
-            self.server.on_hello(conn, msg.get('nick', u''), msg.get('selfDBID', 1))
+            self.server.on_hello(conn, msg.get('nick', u''), msg.get('selfDBID', 1),
+                                 msg.get('entID', 0), msg.get('vehDescr', 0))
         elif not conn.vid:
             return
+        elif mtype == 'prb':
+            self.server.on_prb_msg(conn, msg)
         elif mtype == 'cmd':
             self.server.on_cmd(conn, msg.get('req', -1), msg.get('cmd', -1),
                                msg.get('chan', 0), msg.get('i64', 0),
@@ -1286,6 +1366,8 @@ class _ClientState(object):
             self.transport.client_end.queue({'t': 'hello',
              'nick': self.cfg['nickname'] or _u(getattr(self.player, 'name', '') or u'Commander'),
              'selfDBID': self._self_dbid(),
+             'entID': int(getattr(self.player, 'id', 0) or 0),
+             'vehDescr': current_veh_descr(),
              'ver': PROTO_VER})
         elif mtype == 'welcome':
             self.my_vid = msg.get('vid', 0)
@@ -1303,6 +1385,14 @@ class _ClientState(object):
                 self.transport.send_to_server(queued_msg)
         elif mtype == 'act':
             self._deliver_act(msg.get('data') or {})
+        elif mtype == 'prb':
+            training = getattr(self, 'training', None)
+            if training is not None:
+                try:
+                    training.on_msg(msg)
+                except Exception:
+                    _log('training (prb) client message failed:')
+                    traceback.print_exc()
         elif mtype == 'chat2find':
             self._deliver_chat2_find(msg.get('req', 0), msg.get('users') or [])
         elif mtype == '_disconnected':
@@ -1591,6 +1681,19 @@ def on_account_ready(player):
     state = _ClientState(cfg, player)
     _STATE = state
     _install_patches(state)
+    try:
+        from Offline import MPTraining
+    except ImportError:
+        try:
+            import MPTraining
+        except ImportError:
+            MPTraining = None
+    if MPTraining is not None:
+        try:
+            MPTraining.install(state)
+        except Exception:
+            _log('training rooms install failed:')
+            traceback.print_exc()
     state.transport.start()
     BigWorld.callback(_TICK_PERIOD, _tick)
     _log('local multiplayer started: mode=%s port=%s nickname=%r' % (

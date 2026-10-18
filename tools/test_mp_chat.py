@@ -116,7 +116,9 @@ cs.CHAT_COMMANDS = FakeEnum('chatCommands', [
  'setMuted', 'unsetMuted', 'logVivoxLogin'])
 cs.CHAT_MEMBER_GROUP = FakeEnum('chatMemberGroup', [
  'member', 'channelOwner', 'channelModerator', 'chatAdmin'])
+cs.CHAT_CHANNEL_PREBATTLE = 4
 cs.CHAT_CHANNEL_PRIVATE = 8
+cs.CHAT_CHANNEL_TRAINING = 32
 cs.USERS_ROSTER_FRIEND = 1
 cs.USERS_ROSTER_IGNORED = 2
 cs.USERS_ROSTER_VOICE_MUTED = 4
