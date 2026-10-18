@@ -924,15 +924,79 @@ class _BattleClient(object):
                     own_pos = '(%.1f,%.1f)' % (p[0], p[2])
             except Exception:
                 own_pos = '?'
+            try:
+                srv_t = float(BigWorld.serverTime())
+            except Exception:
+                srv_t = -1.0
+            try:
+                cli_t = float(BigWorld.time())
+            except Exception:
+                cli_t = -1.0
+            try:
+                rot = avatar.gunRotator
+                turret_info = ('(%.2f,%.2f)'
+                               % (rot.turretYaw, rot.gunPitch)) \
+                    if rot is not None else None
+            except Exception:
+                turret_info = '?'
             _log('diag tick %s: initProgress=%s gunRotator=%s '
                  'ownVehicleStarted=%s avatarVehicle=%s spaceLoad=%s '
-                 'worldDraw=%s period=%s pos=%s input=%s'
+                 'worldDraw=%s period=%s pos=%s input=%s srvT=%.1f '
+                 'cliT=%.1f turret=%s'
                  % (n, progress,
                     getattr(avatar, 'gunRotator', None) is not None,
                     own_started, getattr(avatar, 'vehicle', None),
                     space_load, world_draw,
                     getattr(getattr(avatar, 'arena', None),
-                            'period', None), own_pos, self._cur_input))
+                            'period', None), own_pos, self._cur_input,
+                    srv_t, cli_t, turret_info))
+            if n == 2 and own is not None:
+                # One-shot: what can the native filter/physics do?
+                try:
+                    flt = own.filter
+                    names = [x for x in dir(flt)
+                             if not x.startswith('_')]
+                    _log('filter introspect: type=%s attrs=%s'
+                         % (type(flt).__name__,
+                            ','.join(sorted(names))))
+                    get_phys = getattr(flt, 'getVehiclePhysics', None)
+                    phys = get_phys() if callable(get_phys) else None
+                    _log('filter.getVehiclePhysics -> %s' % (phys,))
+                    if phys is not None:
+                        pnames = [x for x in dir(phys)
+                                  if not x.startswith('_')]
+                        _log('physics introspect: type=%s attrs=%s'
+                             % (type(phys).__name__,
+                                ','.join(sorted(pnames))))
+                except Exception:
+                    _log('filter introspect failed:')
+                    traceback.print_exc()
+            if n == 4 and own is not None:
+                # One-shot: does writing entity position/direction
+                # move the drawn model on a client-only vehicle?
+                try:
+                    import Math
+                    before = own.position
+                    _log('pos experiment: before=%s direction=%s'
+                         % (before, getattr(own, 'direction', None)))
+                    own.position = Math.Vector3(before[0] + 3.0,
+                                                  before[1],
+                                                  before[2])
+                    _log('pos experiment: wrote +3x readback=%s'
+                         % (own.position,))
+                except Exception:
+                    _log('pos experiment failed:')
+                    traceback.print_exc()
+                try:
+                    import Math
+                    d = own.direction
+                    own.direction = Math.Vector3(d[0], d[1],
+                                                   d[2] + 0.6)
+                    _log('dir experiment: %s -> %s'
+                         % (d, own.direction))
+                except Exception:
+                    _log('dir experiment failed:')
+                    traceback.print_exc()
         except Exception:
             _log('diag tick %s failed:' % (n,))
             traceback.print_exc()
