@@ -333,30 +333,19 @@ prb(srv, alice, cmd='assign', req=18, playerID=bob.vid, roster=2)
 del a_in[:]
 del b_in[:]
 
-# one-sided readiness auto-reverts (room must not stick "in queue")
-prb(srv, alice, cmd='teamReady', req=11, team=1)
-check(upds(b_in, C.PREBATTLE_UPDATE.TEAM_STATES) == [[2, 1]],
-      'team1 READY broadcast')
-trn = srv.training
-check(len(trn._deferred) == 1, 'one-sided readiness timeout scheduled')
-trn._deferred[0] = (0.0, trn._deferred[0][1], trn._deferred[0][2])
-del a_in[:]
-del b_in[:]
-trn.on_tick()
-check(upds(a_in, C.PREBATTLE_UPDATE.TEAM_STATES) == [[1, 1]]
-      and upds(b_in, C.PREBATTLE_UPDATE.TEAM_STATES) == [[1, 1]]
-      and evs(a_in, 'sysNote'),
-      'one-sided readiness reverted with note')
-del a_in[:]
-del b_in[:]
-
-# both teams ready -> battle starts after deferred tick (MPBattle)
+# creator teamReady («В бой!») readies BOTH teams: stock client swallows
+# the follow-up team-2 request once team 1 shows READY, so the server
+# treats the first request as the battle start signal
 prb(srv, alice, cmd='teamReady', req=19, team=1)
+trn = srv.training
+check(upds(b_in, C.PREBATTLE_UPDATE.TEAM_STATES) == [[2, 2]],
+      'single creator teamReady readies both teams')
+# a duplicate team-2 request (when it does get through) must not
+# schedule a second battle start
+prb(srv, alice, cmd='teamReady', req=20, team=2)
+check(len(trn._deferred) == 1, 'duplicate teamReady keeps one deferred')
 del a_in[:]
 del b_in[:]
-prb(srv, alice, cmd='teamReady', req=20, team=2)
-check(upds(b_in, C.PREBATTLE_UPDATE.TEAM_STATES) == [[2, 2]],
-      'team2 READY broadcast')
 check(len(trn._deferred) == 1, 'battle start deferred scheduled')
 trn._deferred[0] = (0.0, trn._deferred[0][1], trn._deferred[0][2])
 del a_in[:]

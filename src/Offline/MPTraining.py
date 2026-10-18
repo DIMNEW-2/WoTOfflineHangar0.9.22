@@ -50,14 +50,10 @@ import time
 import traceback
 import zlib
 
-_BATTLE_UNAVAILABLE_TEXT = u'Запуск боя недоступен в локальной сети (офлайн-ангар): тренировочные комнаты работают без выхода в бой.'
+_BATTLE_FAILED_TEXT = u'Не удалось начать бой: проверьте, что в каждой команде есть игрок и выбрана карта.'
 _TEAM_CAPACITY = 15
 _ROOM_CAPACITY = 30
 _BATTLE_CANCEL_DELAY = 1.0
-# A single READY team locks most stock-GUI actions (invites, observer
-# switching, roster edits) until the other team readies up. Since no
-# battle can ever start here, do not let that state linger.
-_TEAM_READY_TIMEOUT = 5.0
 _PRB_CHANNEL_NAME = u'#chat:channels/training'
 
 
@@ -550,18 +546,6 @@ class _TrainingServer(object):
                  % (room.room_id,))
             self._cancel_battle(room)
 
-    def _schedule_battle_cancel(self, room, delay):
-        key = ('battle-cancel', room.room_id)
-        self._deferred = [entry for entry in self._deferred
-                          if entry[1] != key]
-        self._deferred.append((time.time() + delay, key,
-                               lambda r=room: self._cancel_battle(r)))
-
-    def _drop_battle_cancel(self, room):
-        key = ('battle-cancel', room.room_id)
-        self._deferred = [entry for entry in self._deferred
-                          if entry[1] != key]
-
     def _assigned_counts(self, room):
         counts = {1: 0, 2: 0}
         for member in room.members.itervalues():
@@ -583,15 +567,22 @@ class _TrainingServer(object):
             counts = self._assigned_counts(room)
             ok = counts[1] > 0 and counts[2] > 0
         if ok:
-            room.team_states[team] = C.PREBATTLE_TEAM_STATE.READY
+            # The only stock-GUI path that emits a creator teamReady is
+            # TrainingRoom.__doStartTraining («В бой!»): it readies team 1,
+            # then team 2. But LegacyEntity.setTeamState gates the SECOND
+            # request on the creator's OWN team state: once our instant
+            # loopback broadcast marks team 1 READY, the client silently
+            # drops the team-2 request (callback(True), nothing sent).
+            # A creator teamReady therefore means "start the battle":
+            # ready BOTH teams server-side. A team-2 request that does
+            # arrive later is a harmless duplicate (start scheduling is
+            # deduplicated).
+            room.team_states[1] = C.PREBATTLE_TEAM_STATE.READY
+            room.team_states[2] = C.PREBATTLE_TEAM_STATE.READY
+            self._resp(conn, msg, True)
             self._broadcast_team_states(room)
-            states = self._team_states(room)
-            if states[0] == C.PREBATTLE_TEAM_STATE.READY \
-                    and states[1] == C.PREBATTLE_TEAM_STATE.READY:
-                self._drop_battle_cancel(room)
-                self._schedule_battle_start(room)
-            else:
-                self._schedule_battle_cancel(room, _TEAM_READY_TIMEOUT)
+            self._schedule_battle_start(room)
+            return
         self._resp(conn, msg, ok)
 
     def _op_team_not_ready(self, conn, msg):
@@ -604,8 +595,6 @@ class _TrainingServer(object):
             room.team_states[team] = C.PREBATTLE_TEAM_STATE.NOT_READY
             self._broadcast_team_states(room)
             self._drop_battle_start(room)
-            if C.PREBATTLE_TEAM_STATE.READY not in self._team_states(room):
-                self._drop_battle_cancel(room)
         self._resp(conn, msg, ok)
 
     def _cancel_battle(self, room):
@@ -621,8 +610,8 @@ class _TrainingServer(object):
             conn = self._conn(vid)
             if conn is not None:
                 self._send(conn, ev='sysNote',
-                           text=_BATTLE_UNAVAILABLE_TEXT)
-        _log('room #%s: battle start refused (offline), teams un-readied'
+                           text=_BATTLE_FAILED_TEXT)
+        _log('room #%s: battle start cancelled, teams un-readied'
              % (room.room_id,))
 
     def _op_kick(self, conn, msg):
