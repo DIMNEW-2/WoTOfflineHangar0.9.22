@@ -455,6 +455,7 @@ class _BattleClient(object):
         self._last_sent = None
         self._last_pose_sent = 0.0
         self._ready_sent = False
+        self._promoted = False
         self._gun_limits = None
         self._pose_unsupported = False
         self._spawn_deadline = 0.0
@@ -609,21 +610,59 @@ class _BattleClient(object):
              % (arena_type_id, arena_type.geometryName, self._space_id,
                 self._my_team, spawn))
 
-        self._avatar_id = BigWorld.createEntity(
-            'Avatar', self._space_id, 0, (spawn[0], 0.0, spawn[1]),
-            (0.0, 0.0, yaw), {})
+        # PlayerAvatar.onEnterWorld runs synchronously inside
+        # createEntity and already reads playerVehicleID (and
+        # onBecomePlayer reads the arena* fields for ClientArena), so
+        # every client-visible Avatar.def property must be present in
+        # the create props - post-creation assignment is too late
+        # (real-client failure 2026-10-18: "'PlayerAvatar' object has
+        # no attribute 'playerVehicleID'" from onEnterWorld).
+        avatar_props = {
+            'name': _b(me.get('nick', u'')),
+            'arenaUniqueID': int(msg.get('arenaUniqueID', 0) or 0),
+            'arenaTypeID': arena_type_id,
+            'arenaBonusType': C.ARENA_BONUS_TYPE.TRAINING,
+            'arenaGuiType': C.ARENA_GUI_TYPE.TRAINING,
+            'arenaExtraData': {},
+            'weatherPresetID': 0,
+            'denunciationsLeft': 0,
+            'clientCtx': '',
+            'tkillIsSuspected': False,
+            'team': self._my_team,
+            'playerVehicleID': 0,
+            'isObserverBothTeams': False,
+            'isGunLocked': False,
+            'ownVehicleGear': 0,
+            'ownVehicleAuxPhysicsData': 0,
+            'isObserverFPV': False,
+            'observerFPVControlMode': 0,
+            'numOfObservers': 0}
+        try:
+            self._avatar_id = BigWorld.createEntity(
+                'Avatar', self._space_id, 0, (spawn[0], 0.0, spawn[1]),
+                (0.0, 0.0, yaw), avatar_props)
+        except Exception:
+            # Engine rejected some property: retry with only the
+            # fields read during creation/promotion.
+            _log('Avatar createEntity with full props failed, '
+                 'retrying minimal:')
+            traceback.print_exc()
+            minimal = dict((key, avatar_props[key]) for key in (
+                'name', 'arenaUniqueID', 'arenaTypeID', 'arenaBonusType',
+                'arenaGuiType', 'arenaExtraData', 'weatherPresetID',
+                'team', 'playerVehicleID'))
+            self._avatar_id = BigWorld.createEntity(
+                'Avatar', self._space_id, 0, (spawn[0], 0.0, spawn[1]),
+                (0.0, 0.0, yaw), minimal)
         avatar = BigWorld.entities[self._avatar_id]
         self._avatar = avatar
-        avatar.arenaUniqueID = int(msg.get('arenaUniqueID', 0) or 0)
-        avatar.arenaTypeID = arena_type_id
-        avatar.arenaBonusType = C.ARENA_BONUS_TYPE.TRAINING
-        avatar.arenaGuiType = C.ARENA_GUI_TYPE.TRAINING
-        avatar.arenaExtraData = {}
-        avatar.weatherPresetID = 0
-        avatar.name = _b(me.get('nick', u''))
-        avatar.team = self._my_team
         avatar.fakeServer = self._bridge
         avatar._mpBattle = True
+        # helpers.statistics polls BigWorld.player().prebattle every
+        # tick; only PlayerAccount defines it in stock (the Avatar
+        # normally inherits the value through the account repository
+        # hand-off that never happens for our client-only Avatar).
+        avatar.prebattle = None
 
         self.active = True
         self._ready_sent = False
@@ -631,6 +670,7 @@ class _BattleClient(object):
         # BigWorld.player dispatch): PlayerAvatar.onBecomePlayer creates
         # the ClientArena and starts the stock battle GUI session.
         BigWorld.player(avatar)
+        self._promoted = True
         _log('avatar promoted to player (id=%s)' % (self._avatar_id,))
         self._spawn_deadline = time.time() + _SPAWN_WAIT_TIMEOUT
         BigWorld.callback(0.25, self._wait_for_space)
@@ -645,16 +685,48 @@ class _BattleClient(object):
 
     def _spawn_point(self, arena_type, player):
         team = int(player.get('team', 1))
-        points = []
+        spawn_index = int(player.get('spawn', 0))
+        # ArenaType.__getattr__ prefers the gameplay cfg, whose
+        # teamSpawnPoints are empty lists when the gameplay section
+        # does not redefine them (the real points live in the geometry
+        # cfg) - so fall through to the geometry cache, then to the
+        # team base, before giving up to the map center. Without this
+        # every vehicle spawned stacked at the bounding-box center
+        # (real-client test 2026-10-18, arena 101_dday: (100, 0)).
+        sources = [arena_type]
         try:
-            points = arena_type.teamSpawnPoints[team - 1]
+            import ArenaType
+            geometry = ArenaType.g_geometryCache.get(
+                int(getattr(arena_type, 'id', 0)) & 0xFFFF)
+            if geometry is not None:
+                sources.append(geometry)
         except Exception:
-            points = []
-        if not points:
-            center = self._arena_center(arena_type)
-            return (center[0], center[1])
-        point = points[int(player.get('spawn', 0)) % len(points)]
-        return (float(point[0]), float(point[1]))
+            pass
+        for source in sources:
+            try:
+                points = source.teamSpawnPoints[team - 1]
+            except Exception:
+                points = []
+            if points:
+                point = points[spawn_index % len(points)]
+                return (float(point[0]), float(point[1]))
+        for source in sources:
+            try:
+                bases = source.teamBasePositions[team - 1]
+                base = None
+                if isinstance(bases, dict) and bases:
+                    base = bases[sorted(bases.keys())[0]]
+                elif bases:
+                    base = bases[0]
+                if base is not None:
+                    return (float(base[0]) + spawn_index * 10.0,
+                            float(base[1]))
+            except Exception:
+                pass
+        center = self._arena_center(arena_type)
+        team_offset = -60.0 if team == 1 else 60.0
+        return (center[0] + team_offset,
+                center[1] + spawn_index * 10.0)
 
     def _terrain_y(self, x, z):
         import BigWorld
@@ -777,7 +849,7 @@ class _BattleClient(object):
             raise RuntimeError('own vehicle was not spawned')
         # Stock player-vehicle binding (set_<prop> notifier replay).
         avatar = self._avatar
-        prev = avatar.playerVehicleID
+        prev = getattr(avatar, 'playerVehicleID', 0)
         avatar.playerVehicleID = own_entity_id
         try:
             avatar.set_playerVehicleID(prev)
@@ -903,7 +975,24 @@ class _BattleClient(object):
         self._tearing_down = True
         import BigWorld
         _log('tearing down battle, returning to hangar')
-        # Vehicles first, while the avatar is still the player.
+        # Promote the hangar Account FIRST, while the Avatar entity is
+        # still alive: the engine demotes the Avatar, whose stock
+        # onBecomeNonPlayer stops the battle GUI session, destroys the
+        # ClientArena and detaches the chat proxy, and only then does
+        # Account.onBecomePlayer run cleanly. Destroying the Avatar
+        # first (the original order) left the battle session ticking
+        # forever and made ChatManager.switchPlayerProxy crash on the
+        # destroyed Avatar's emptied __dict__ (real-client failure
+        # 2026-10-18).
+        account = getattr(self.state, 'player', None)
+        was_promoted = self._promoted
+        if account is not None and was_promoted:
+            try:
+                BigWorld.player(account)
+            except Exception:
+                _log('account re-promotion failed:')
+                traceback.print_exc()
+            self._promoted = False
         for entity_id in list(self._vehicles.itervalues()):
             try:
                 BigWorld.destroyEntity(entity_id)
@@ -936,27 +1025,64 @@ class _BattleClient(object):
         self._space_id = 0
         self._mapping_id = 0
         self.active = False
-        # Promote the hangar Account again (real setter via dispatch).
-        account = getattr(self.state, 'player', None)
-        if account is not None:
-            try:
-                BigWorld.player(account)
-            except Exception:
-                _log('account re-promotion failed:')
-                traceback.print_exc()
         try:
             from PlayerEvents import g_playerEvents
             if getattr(g_playerEvents, 'isPlayerEntityChanging', False):
                 g_playerEvents.isPlayerEntityChanging = False
         except Exception:
             pass
-        try:
-            from gui.app_loader import g_appLoader
-            g_appLoader.showLobby()
-        except Exception:
-            pass
+        # Rebuild the lobby GUI exactly like Offline.Manager's
+        # _show_lobby: Account.showGUI restores databaseID (stock
+        # onBecomePlayer nulled it) and drives the app-loader lobby
+        # transition via onAccountShowGUI. Deferred so the battle app
+        # finishes unloading first.
+        if account is not None and was_promoted:
+            try:
+                BigWorld.callback(0.3, self._restore_lobby)
+            except Exception:
+                self._restore_lobby()
         self._tearing_down = False
         _log('back in hangar')
+
+    def _restore_lobby(self):
+        account = getattr(self.state, 'player', None)
+        if account is None:
+            return
+        import BigWorld
+        import cPickle
+        try:
+            account.showGUI(cPickle.dumps(
+                {'databaseID': 1, 'currentVehInvID': 1}))
+            _log('lobby GUI restored via Account.showGUI')
+        except Exception:
+            _log('Account.showGUI on lobby restore failed:')
+            traceback.print_exc()
+        try:
+            from PlayerEvents import g_playerEvents
+            g_playerEvents.onStatsResync()
+        except Exception:
+            pass
+        try:
+            from Offline import Manager
+            offline_state = Manager.get_offline_state()
+            resync = offline_state.get('resync_inventory')
+            if resync is not None:
+                resync()
+            select_vehicle = offline_state.get('select_vehicle')
+            if select_vehicle is not None:
+                off_stats = offline_state.get('off_stats') or {}
+                BigWorld.callback(0.7, lambda: select_vehicle(
+                    off_stats.get('currentVehInvID', 1)))
+        except Exception:
+            pass
+        # The real onAccountBecomePlayer/onAccountShowGUI events fired
+        # this time, so the stock messenger should have reconnected by
+        # itself; only replay MPChat's forced lobby init if it did not.
+        try:
+            if not self.state._messenger_ready():
+                self.state._ensure_messenger_lobby()
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -1012,14 +1138,57 @@ def _install_account_patch():
         # created space. Suppress exactly that one call (battle space
         # is released explicitly by the battle teardown).
         import BigWorld
+        # Account.onBecomeNonPlayer (fired when the battle Avatar was
+        # promoted) detached every repository subsystem via
+        # setAccount(None)/setProxy(None). Stock onBecomePlayer assumes
+        # a fresh Account whose __init__ bound them; our Account is
+        # reused, so rebind exactly like __init__ does, otherwise the
+        # subsystems' onAccountBecomePlayer run against account=None.
+        for _name in ('syncData', 'inventory', 'stats', 'questProgress',
+                      'shop', 'dossierCache', 'battleResultsCache',
+                      'gMap', 'goodies', 'vehicleRotation', 'recycleBin',
+                      'ranked', 'badges', 'newYear'):
+            _sub = getattr(self, _name, None)
+            if _sub is not None:
+                try:
+                    _sub.setAccount(self)
+                except Exception:
+                    pass
+        try:
+            self.intUserSettings.setProxy(self, self.syncData)
+        except Exception:
+            pass
+        try:
+            self.prebattleInvitations.setProxy(self)
+        except Exception:
+            pass
         orig_clear = getattr(BigWorld, 'clearAllSpaces', None)
         if callable(orig_clear):
             BigWorld.clearAllSpaces = lambda: None
         try:
-            return orig_become_player(self)
+            result = orig_become_player(self)
         finally:
             if callable(orig_clear):
                 BigWorld.clearAllSpaces = orig_clear
+        # syncData.onAccountBecomePlayer restarted a server sync that
+        # can never complete offline. Force the synced state exactly
+        # like Offline.Manager does at hangar bootstrap.
+        try:
+            import AccountCommands
+            sync_data = self.syncData
+            sync_data._AccountSyncData__ignore = False
+            sync_data._AccountSyncData__isSynchronized = True
+            subscribers = list(getattr(
+                sync_data, '_AccountSyncData__subscribers', []))
+            for subscriber in subscribers:
+                try:
+                    subscriber(AccountCommands.RES_CACHE)
+                except Exception:
+                    pass
+            sync_data._AccountSyncData__subscribers = []
+        except Exception:
+            pass
+        return result
 
     PlayerAccount.onBecomePlayer = _on_become_player
     PlayerAccount._mpBattlePatched = True

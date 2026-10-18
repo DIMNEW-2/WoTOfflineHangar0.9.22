@@ -405,6 +405,123 @@ check(_acc.became_player is True and not _bw_clear_calls,
 BW.clearAllSpaces()
 check(_bw_clear_calls == [True], 'clearAllSpaces restored after wrapper')
 
+# --- battle enter / teardown (regressions from the 2026-10-18 test) --------
+# onEnterWorld reads playerVehicleID synchronously inside createEntity,
+# gameplay cfg shadows geometry spawn points with empty lists, and the
+# Account must be re-promoted BEFORE the Avatar entity is destroyed.
+_bw_order = []
+_bw_created = []
+
+
+class _FakeAvatarEnt(object):
+    pass
+
+
+def _bw_create_space():
+    _bw_order.append(('space',))
+    return 55
+
+
+def _bw_create_entity(cls_name, space_id, veh_id, pos, dir_, props):
+    ent = _FakeAvatarEnt()
+    eid = 9000 + len(_bw_created)
+    _bw_entities[eid] = ent
+    _bw_created.append((cls_name, pos, dict(props)))
+    _bw_order.append(('create', cls_name, eid))
+    return eid
+
+
+def _bw_player(entity):
+    _bw_order.append(('player', entity))
+
+
+def _bw_destroy(eid):
+    _bw_order.append(('destroy', eid))
+
+
+BW.createSpace = _bw_create_space
+BW.addSpaceGeometryMapping = lambda sid, mid, path: 66
+BW.createEntity = _bw_create_entity
+BW.player = _bw_player
+BW.destroyEntity = _bw_destroy
+BW.cameraSpaceID = lambda sid: None
+BW.isClientSpace = lambda sid: True
+BW.delSpaceGeometryMapping = lambda sid, mid: None
+BW.clearSpace = lambda sid: None
+BW.releaseSpace = lambda sid: None
+
+arena_mod = types.ModuleType('ArenaType')
+_geom = _ns(teamSpawnPoints=([(10, 20), (30, 40)], [(-10, -20)]),
+            teamBasePositions=({}, {}))
+_atype = _ns(id=70, geometryName='101_dday',
+             boundingBox=((-500, -500), (700, 500)),
+             teamSpawnPoints=([], []), teamBasePositions=({}, {}))
+arena_mod.g_cache = {70: _atype}
+arena_mod.g_geometryCache = {70: _geom}
+sys.modules['ArenaType'] = arena_mod
+
+pe_mod = types.ModuleType('PlayerEvents')
+pe_mod.g_playerEvents = _ns(isPlayerEntityChanging=False,
+                            onStatsResync=lambda: None)
+sys.modules['PlayerEvents'] = pe_mod
+
+offline_pkg = types.ModuleType('Offline')
+manager_stub = types.ModuleType('Offline.Manager')
+manager_stub.get_offline_state = lambda: {}
+offline_pkg.Manager = manager_stub
+sys.modules['Offline'] = offline_pkg
+sys.modules['Offline.Manager'] = manager_stub
+
+
+class _FakeAccountEnt(object):
+
+    def __init__(self):
+        self.gui_ctx = None
+
+    def showGUI(self, ctx):
+        self.gui_ctx = cPickle.loads(ctx)
+
+
+_fake_account = _FakeAccountEnt()
+state3 = _ns(my_vid=100001, transport=_FakeTransport(),
+             player=_fake_account, _messenger_ready=lambda: True)
+client3 = BTL._BattleClient(state3)
+client3._enter({'arenaTypeID': 70, 'arenaUniqueID': 123, 'roomID': 1,
+                'battleID': 1, 'roundLength': 600,
+                'players': [{'vid': 100001, 'team': 1, 'nick': u'Me',
+                             'spawn': 1},
+                            {'vid': 100002, 'team': 2, 'nick': u'Other',
+                             'spawn': 0}]})
+check(len(_bw_created) == 1 and _bw_created[0][0] == 'Avatar',
+      'enter creates one Avatar entity')
+_props = _bw_created[0][2]
+check(_props.get('playerVehicleID') == 0 and _props.get('team') == 1
+      and _props.get('arenaTypeID') == 70
+      and _props.get('arenaUniqueID') == 123
+      and _props.get('name') == 'Me',
+      'avatar def props seeded in createEntity (playerVehicleID=0)')
+check(_bw_created[0][1] == (30.0, 0.0, 40.0),
+      'spawn point falls back to geometry cache points')
+check(client3._avatar.prebattle is None,
+      'avatar gets prebattle=None for the statistics poller')
+check(('player', client3._avatar) in _bw_order and client3.active,
+      'avatar promoted to player on enter')
+
+_bw_order[:] = []
+_cb_before = len(_bw_callbacks)
+client3._teardown()
+_names = [entry[0] for entry in _bw_order]
+check('player' in _names and 'destroy' in _names
+      and _names.index('player') < _names.index('destroy'),
+      'teardown promotes Account before destroying Avatar')
+check(_bw_order[_names.index('player')][1] is _fake_account,
+      'teardown promotes the hangar Account')
+check(not client3.active, 'client inactive after teardown')
+check(len(_bw_callbacks) > _cb_before, 'lobby restore scheduled')
+_bw_callbacks[-1][1]()
+check(_fake_account.gui_ctx == {'databaseID': 1, 'currentVehInvID': 1},
+      'lobby restore calls Account.showGUI with databaseID=1')
+
 print('---')
 print('%d checks failed' % len(FAILS))
 if FAILS:
