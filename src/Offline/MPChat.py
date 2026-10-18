@@ -1022,7 +1022,7 @@ class _ClientState(object):
         self.out_queue = []
         self.pending_acts = []
         self.welcome_time = 0.0
-        self.tried_force_connect = False
+        self.next_messenger_attempt = 0.0
         self.my_vid = 0
         self.my_nick = u''
         self.friend_status_action_idx = _cs().CHAT_ACTIONS.friendStatusUpdate.index()
@@ -1061,7 +1061,7 @@ class _ClientState(object):
             self.my_vid = msg.get('vid', 0)
             self.my_nick = _u(msg.get('nick', u''))
             self.welcome_time = time.time()
-            self.tried_force_connect = False
+            self.next_messenger_attempt = 0.0
             _log('connected as %s (vid=%s, hosting=%s)' % (_b(self.my_nick), self.my_vid, self.transport.server is not None))
             try:
                 if self.my_nick and _u(getattr(self.player, 'name', '')) != self.my_nick:
@@ -1086,38 +1086,83 @@ class _ClientState(object):
         except Exception:
             return 1
 
-    def _bw_connected(self):
-        """Server pushes must not be delivered before the BW messenger
-        proto has connected in the lobby (its listeners would miss them)."""
+    def _messenger_ready(self):
+        """True once the stock messenger finished its lobby connect:
+        the BW proto is connected (its listeners would otherwise miss
+        server pushes) and the MIGRATION proto has its contacts/messages
+        proxies (the lobby GUI views dereference them unconditionally
+        and crash while they are None)."""
         try:
             from messenger import MessengerEntry
-            bw = MessengerEntry.g_instance.protos.BW
-            return bool(bw is not None and bw.isConnected())
+            protos = MessengerEntry.g_instance.protos
+            bw = protos.BW
+            if bw is None or not bw.isConnected():
+                return False
+            migration = protos.MIGRATION
+            return migration.contacts is not None and migration.messages is not None
         except ImportError:
             return True  # stub/test environment without the messenger
         except Exception:
             return False
 
-    def _try_force_bw_connect(self):
-        self.tried_force_connect = True
+    def _ensure_messenger_lobby(self):
+        """Replay MessengerEntry's lobby handlers, which never fire
+        offline: Manager does not call PlayerAccount.onAccountBecomePlayer,
+        so g_playerEvents.onAccountBecomePlayer / onAccountShowGUI stay
+        silent and the messenger never connects (MIGRATION contacts /
+        messages stay None and every stock messenger window crashes).
+        Each stock step is attempted independently; failures are logged
+        and retried on a later tick. setFilters is skipped: it already
+        ran in MessengerEntry.init() at game start."""
         try:
-            from messenger import MessengerEntry
+            from messenger import MessengerEntry, g_settings
             from messenger.m_constants import MESSENGER_SCOPE
-            MessengerEntry.g_instance.protos.BW.connect(MESSENGER_SCOPE.LOBBY)
-            _log('forced BW proto connect (messenger was not connected)')
+            entry = MessengerEntry.g_instance
         except Exception:
-            _log('force BW proto connect failed:')
+            _log('messenger lobby init: imports failed:')
             traceback.print_exc()
+            return
+        scope = MESSENGER_SCOPE.LOBBY
+        # MessengerEntry.__pe_onAccountBecomePlayer body, then the
+        # public onAccountShowGUI (playerHelper.initPersonalAccount,
+        # storage.restoreFromCache, protos.view(LOBBY)).
+        steps = (('g_settings.update', g_settings.update, ()),
+         ('storage.switch', entry.storage.switch, (scope,)),
+         ('protos.connect', entry.protos.connect, (scope,)),
+         ('gui.switch', entry.gui.switch, (scope,)),
+         ('onAccountShowGUI', entry.onAccountShowGUI, ()))
+        for name, fn, args in steps:
+            try:
+                fn(*args)
+            except Exception:
+                _log('messenger lobby init: %s failed:' % name)
+                traceback.print_exc()
+        # The decorator's connect() walks all plugins in one call; if a
+        # sibling plugin raised midway, connect the two plugins the
+        # lobby chat actually needs directly.
+        try:
+            protos = entry.protos
+            if not protos.BW.isConnected():
+                protos.BW.connect(scope)
+            if protos.MIGRATION.contacts is None or protos.MIGRATION.messages is None:
+                protos.MIGRATION.connect(scope)
+        except Exception:
+            _log('messenger lobby init: direct proto connect failed:')
+            traceback.print_exc()
+        _log('messenger lobby init done, ready=%s' % self._messenger_ready())
 
     def flush_pending(self):
+        if not self._messenger_ready():
+            now = time.time()
+            if now >= self.next_messenger_attempt:
+                self.next_messenger_attempt = now + 3.0
+                self._ensure_messenger_lobby()
         if not self.pending_acts:
             return
         waited = time.time() - self.welcome_time if self.welcome_time else 0.0
-        if not self._bw_connected():
-            if waited > 5.0 and not self.tried_force_connect:
-                self._try_force_bw_connect()
-            elif waited > 15.0:
-                _log('messenger still not connected after 15s, delivering %d queued acts anyway' % len(self.pending_acts))
+        if not self._messenger_ready():
+            if waited > 15.0:
+                _log('messenger still not ready after 15s, delivering %d queued acts anyway' % len(self.pending_acts))
             else:
                 return
         pending, self.pending_acts = self.pending_acts, []
@@ -1125,7 +1170,7 @@ class _ClientState(object):
             self._deliver_act_now(data)
 
     def _deliver_act(self, data):
-        if not self._bw_connected() and not (self.welcome_time and time.time() - self.welcome_time > 15.0):
+        if not self._messenger_ready() and not (self.welcome_time and time.time() - self.welcome_time > 15.0):
             self.pending_acts.append(data)
             return
         self._deliver_act_now(data)
