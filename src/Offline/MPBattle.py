@@ -469,6 +469,9 @@ class _BattleClient(object):
         self._pose_unsupported = False
         self._spawn_deadline = 0.0
         self._shoot_logged = False
+        self._period_state = None
+        self._period_ticking = False
+        self._script_input_probe = None
 
     # -- transport --------------------------------------------------------
 
@@ -951,51 +954,86 @@ class _BattleClient(object):
                             'period', None), own_pos, self._cur_input,
                     srv_t, cli_t, turret_info))
             if n == 2 and own is not None:
-                # One-shot: what can the native filter/physics do?
+                # One-shot: filter/physics state values, method
+                # docs, and a probe of setScriptInputCallback -
+                # the only possible script-side pose feeding channel
+                # (absent on the reference's #1513 build).
                 try:
                     flt = own.filter
-                    names = [x for x in dir(flt)
-                             if not x.startswith('_')]
-                    _log('filter introspect: type=%s attrs=%s'
-                         % (type(flt).__name__,
-                            ','.join(sorted(names))))
                     get_phys = getattr(flt, 'getVehiclePhysics', None)
                     phys = get_phys() if callable(get_phys) else None
-                    _log('filter.getVehiclePhysics -> %s' % (phys,))
                     if phys is not None:
-                        pnames = [x for x in dir(phys)
-                                  if not x.startswith('_')]
-                        _log('physics introspect: type=%s attrs=%s'
-                             % (type(phys).__name__,
-                                ','.join(sorted(pnames))))
+                        for _attr in ('isFrozen', 'staticMode',
+                                      'movementSignals', 'speed',
+                                      'isOutOfControl', 'badState',
+                                      'handbrake', 'velocity',
+                                      'touchGround', 'allowFreeze'):
+                            _log('physics.%s = %s'
+                                 % (_attr,
+                                    getattr(phys, _attr, '<none>')))
+                    for _attr in ('ignoreInputs', 'latestInput',
+                                  'velocity', 'canExtrapolateOnLag',
+                                  'isLaggingNow', 'allowCustomResets'):
+                        _log('filter.%s = %s'
+                             % (_attr, getattr(flt, _attr, '<none>')))
+                    for _meth in ('reset', 'setScriptInputCallback',
+                                  'transferInput',
+                                  'notifyInputKeysDown'):
+                        _m = getattr(flt, _meth, None)
+                        _log('filter.%s doc=%r'
+                             % (_meth, getattr(_m, '__doc__', None)))
+                    _log('serverTime raw=%r'
+                         % (BigWorld.serverTime(),))
+                    _tw = [x for x in dir(BigWorld)
+                           if 'time' in x.lower()]
+                    _log('BigWorld time fns: %s'
+                         % (','.join(sorted(_tw)),))
+                    _vw = [x for x in dir(BigWorld)
+                           if 'ehicle' in x]
+                    _log('BigWorld vehicle fns: %s'
+                         % (','.join(sorted(_vw)),))
+                    _sic = getattr(flt, 'setScriptInputCallback', None)
+                    if callable(_sic):
+                        _probe_log = [0]
+
+                        def _script_input_probe(*args):
+                            if _probe_log[0] < 5:
+                                _probe_log[0] += 1
+                                _log('script input callback fired: '
+                                     'args=%r' % (args,))
+                            return None
+
+                        self._script_input_probe = \
+                            _script_input_probe
+                        try:
+                            _sic(_script_input_probe)
+                            _log('setScriptInputCallback accepted')
+                        except Exception:
+                            _log('setScriptInputCallback rejected:')
+                            traceback.print_exc()
                 except Exception:
                     _log('filter introspect failed:')
                     traceback.print_exc()
-            if n == 4 and own is not None:
-                # One-shot: does writing entity position/direction
-                # move the drawn model on a client-only vehicle?
+            if n == 12 and own is not None:
+                # Re-read the suspect values once with the player
+                # actively driving: did input register in physics?
                 try:
-                    import Math
-                    before = own.position
-                    _log('pos experiment: before=%s direction=%s'
-                         % (before, getattr(own, 'direction', None)))
-                    own.position = Math.Vector3(before[0] + 3.0,
-                                                  before[1],
-                                                  before[2])
-                    _log('pos experiment: wrote +3x readback=%s'
-                         % (own.position,))
+                    flt = own.filter
+                    phys = flt.getVehiclePhysics()
+                    _log('physics@12: isFrozen=%s movementSignals=%s '
+                         'speed=%s badState=%s handbrake=%s'
+                         % (getattr(phys, 'isFrozen', '?'),
+                            getattr(phys, 'movementSignals', '?'),
+                            getattr(phys, 'speed', '?'),
+                            getattr(phys, 'badState', '?'),
+                            getattr(phys, 'handbrake', '?')))
+                    _log('filter@12: ignoreInputs=%s latestInput=%s '
+                         'velocity=%s'
+                         % (getattr(flt, 'ignoreInputs', '?'),
+                            getattr(flt, 'latestInput', '?'),
+                            getattr(flt, 'velocity', '?')))
                 except Exception:
-                    _log('pos experiment failed:')
-                    traceback.print_exc()
-                try:
-                    import Math
-                    d = own.direction
-                    own.direction = Math.Vector3(d[0], d[1],
-                                                   d[2] + 0.6)
-                    _log('dir experiment: %s -> %s'
-                         % (d, own.direction))
-                except Exception:
-                    _log('dir experiment failed:')
+                    _log('physics re-read failed:')
                     traceback.print_exc()
         except Exception:
             _log('diag tick %s failed:' % (n,))
@@ -1005,7 +1043,7 @@ class _BattleClient(object):
         elif n < 15:
             BigWorld.callback(5.0, lambda: self._diag_tick(n + 1))
 
-    def _publish_period(self, period, length):
+    def _publish_period(self, period, length, _republish=False):
         if self._avatar is None:
             return
         import BigWorld
@@ -1015,7 +1053,36 @@ class _BattleClient(object):
         self._avatar.updateArena(
             C.ARENA_UPDATE.PERIOD,
             _pack_period(period, end_time, length))
+        if _republish:
+            return
         _log('arena period -> %s (%.0fs)' % (period, length))
+        # BigWorld.serverTime() is permanently -1 on a disconnected
+        # client (real-client test 2026-10-18 #14), so a stock GUI
+        # countdown computed as periodEndTime - serverTime() never
+        # advances. Republish the same period every second with a
+        # shrinking remainder; ClientArena refires onPeriodChange
+        # for every PERIOD update, so the timer counts down.
+        self._period_state = (period, time.time() + float(length)) \
+            if length > 0 else None
+        if length > 1 and not self._period_ticking:
+            self._period_ticking = True
+            BigWorld.callback(1.0, self._period_tick)
+
+    def _period_tick(self):
+        self._period_ticking = False
+        if not self.active or self._tearing_down:
+            return
+        state = self._period_state
+        if not state:
+            return
+        period, deadline = state
+        remaining = deadline - time.time()
+        if remaining <= 0.5:
+            return
+        self._publish_period(period, remaining, _republish=True)
+        import BigWorld
+        self._period_ticking = True
+        BigWorld.callback(1.0, self._period_tick)
 
     # -- bridge callbacks ---------------------------------------------------
 
