@@ -120,6 +120,8 @@ cs.CHAT_CHANNEL_PRIVATE = 8
 cs.USERS_ROSTER_FRIEND = 1
 cs.USERS_ROSTER_IGNORED = 2
 cs.USERS_ROSTER_VOICE_MUTED = 4
+cs.SYS_MESSAGE_TYPE = FakeEnum('sysMessageType', ['serverReboot', 'adminTextMessage'])
+cs.SYS_MESSAGE_IMPORTANCE = FakeEnum('sysMessageImportance', ['normal', 'high'])
 cs.g_chatCooldownData = {}
 cs.isOperationInCooldown = lambda data, cmd: False
 
@@ -327,6 +329,88 @@ server.detach('b')
 left = acts_of(a_in, A.leave)
 check(len(left) >= 1 and any(a['originator'] == bob.vid for a in left), 'disconnect notifies channel members')
 check(bob.vid not in server.by_vid, 'disconnected player unregistered')
+
+# --------------------------------------------------------------------------
+# Persistence: stable vids, rosters, channels, history + notifications
+# --------------------------------------------------------------------------
+import tempfile
+state_fd, state_file = tempfile.mkstemp(suffix='.json')
+os.close(state_fd)
+os.remove(state_file)
+
+srv = MP._MPServer(state_file)
+dave, d_in = fresh_conn(srv, 'd1', u'Dave')
+Erin, e_in = fresh_conn(srv, 'e1', u'Erin')
+dave_vid = dave.vid
+erin_vid = Erin.vid
+
+# friend add -> service-channel notification to the added player, once
+del d_in[:]
+del e_in[:]
+cmd(srv, dave, C.addFriend, i64=erin_vid, s1=u'Erin')
+notes = acts_of(e_in, A.personalSysMessage)
+check(len(notes) == 1 and notes[0]['data']['type'] == cs.SYS_MESSAGE_TYPE.adminTextMessage.index()
+      and u'Dave' in notes[0]['data']['data'], 'friend-add service notification: %r' % (notes,))
+del e_in[:]
+cmd(srv, dave, C.addFriend, i64=erin_vid, s1=u'Erin')
+check(not acts_of(e_in, A.personalSysMessage), 'no duplicate notification for existing friend')
+
+# channels + history (incl. private)
+cmd(srv, dave, C.enterChatChannel, chan=1)
+cmd(srv, dave, C.broadcast, chan=1, s1=u'persistent hello')
+cmd(srv, dave, C.createChatChannel, s1=u'KeepMe', s2=u'pw')
+keep_id = acts_of(d_in, A.createChannel)[0]['data']['id']
+cmd(srv, dave, C.enterChatChannel, chan=keep_id, s1=u'pw')
+cmd(srv, dave, C.broadcast, chan=keep_id, s1=u'channel memory')
+cmd(srv, dave, C.createPrivate, i64=erin_vid, s1=u'Erin')
+priv_id2 = acts_of(d_in, A.requestChannels)[-1]['data'][0]['id']
+cmd(srv, dave, C.broadcast, chan=priv_id2, s1=u'private memory')
+# an empty user channel must survive (no auto-destroy)
+cmd(srv, dave, C.leaveChatChannel, chan=keep_id)
+check(keep_id in srv.channels, 'empty user channel is kept')
+
+srv.detach('d1')
+srv.detach('e1')
+srv.flush_state(force=True)
+check(os.path.exists(state_file), 'state file written')
+
+srv2 = MP._MPServer(state_file)
+dave2, d2_in = fresh_conn(srv2, 'd2', u'Dave')
+check(dave2.vid == dave_vid, 'stable vid across sessions (%s)' % dave2.vid)
+roster2 = acts_of(d2_in, A.requestUsersRoster)
+check(roster2 and roster2[0]['data'] == [[erin_vid, u'Erin', cs.USERS_ROSTER_FRIEND]],
+      'roster restored: %r' % (roster2,))
+status2 = acts_of(d2_in, A.friendStatusUpdate)
+check(any(a['data'] == [[erin_vid, False]] for a in status2), 'restored friend shown offline')
+del d2_in[:]
+cmd(srv2, dave2, C.findChatChannels, s1=u'keep', req=3)
+found2 = acts_of(d2_in, A.requestChannels)
+check(len(found2) == 1 and found2[0]['data'][0]['id'] == keep_id and found2[0]['data'][0]['owner'] == 1,
+      'user channel restored with same id/owner')
+cmd(srv2, dave2, C.enterChatChannel, chan=keep_id, s1=u'pw')
+check([a['data'] for a in acts_of(d2_in, A.broadcast)] == [u'channel memory'], 'channel history restored')
+del d2_in[:]
+cmd(srv2, dave2, C.enterChatChannel, chan=1)
+check([a['data'] for a in acts_of(d2_in, A.broadcast)] == [u'persistent hello'], 'common channel history restored')
+del d2_in[:]
+# presence pushes when the friend comes and goes
+erin2, e2_in = fresh_conn(srv2, 'e2', u'Erin')
+check(erin2.vid == erin_vid, 'stable vid for second player')
+check(any(a['data'] == [[erin_vid, True]] for a in acts_of(d2_in, A.friendStatusUpdate)),
+      'presence push: friend came online')
+del d2_in[:]
+srv2.detach('e2')
+check(any(a['data'] == [[erin_vid, False]] for a in acts_of(d2_in, A.friendStatusUpdate)),
+      'presence push: friend went offline')
+# private history restored for the same pair
+erin3, e3_in = fresh_conn(srv2, 'e3', u'Erin')
+del d2_in[:]
+cmd(srv2, dave2, C.createPrivate, i64=erin_vid, s1=u'Erin')
+check([a['data'] for a in acts_of(d2_in, A.broadcast)] == [u'private memory'], 'private history restored')
+srv2.flush_state(force=True)
+os.remove(state_file)
+if os.path.exists(state_file + '.tmp'):
+    os.remove(state_file + '.tmp')
 
 # --------------------------------------------------------------------------
 # Transport over real loopback sockets

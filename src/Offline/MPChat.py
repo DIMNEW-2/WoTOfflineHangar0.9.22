@@ -27,6 +27,14 @@ over loopback like any other client. In ``auto`` mode (default) a client
 first looks for a host via UDP broadcast discovery and becomes the host
 itself if none answers - just start the host machine's client first.
 
+The host persists its state to ``mp_state.json`` next to the config:
+virtual IDs are stable per nickname, and rosters, user channels (with
+passwords/moderators/bans), the common/user/private message history all
+survive host restarts. Adding a player to friends also sends them a
+service-channel notification (stock rosters are silent), and a small
+client patch makes the system "common" channel button blink on new
+messages like regular channels do.
+
 Because every offline account has databaseID=1, the host assigns a
 virtual ID to each connection and rewrites user IDs per recipient (a
 player always sees himself under his own databaseID, everyone else under
@@ -59,6 +67,11 @@ _VIRTUAL_ID_BASE = 100000
 _FIRST_USER_CHANNEL_ID = 100
 _HISTORY_LIMIT = 50
 _TICK_PERIOD = 0.05
+# Host-side persistent state (stable per-nickname vids, rosters, user
+# channels and message history) stored next to mp_config.txt.
+_STATE_FILENAME = 'mp_state.json'
+_STATE_VERSION = 1
+_STATE_SAVE_THROTTLE = 1.0
 
 _STATE = None
 
@@ -106,7 +119,8 @@ def _sanitize_nick(nick):
 # ---------------------------------------------------------------------------
 
 def _load_config():
-    cfg = {'mode': 'auto', 'host': '', 'port': DEFAULT_PORT, 'nickname': ''}
+    cfg = {'mode': 'auto', 'host': '', 'port': DEFAULT_PORT, 'nickname': '',
+     '_state_path': _STATE_FILENAME}
     text = None
     candidates = ['mp_config.txt',
      'res_mods/0.9.21.0.2/mp_config.txt',
@@ -118,6 +132,9 @@ def _load_config():
             with open(path, 'r') as f:
                 text = f.read()
             _log('config loaded from %s' % path)
+            # The persistent host state (rosters, channels, history)
+            # lives next to the config that was actually found.
+            cfg['_state_path'] = ('%s/%s' % (path.rsplit('/', 1)[0], _STATE_FILENAME)) if '/' in path else _STATE_FILENAME
             break
         except Exception:
             continue
@@ -197,16 +214,150 @@ class _Chan(object):
 
 class _MPServer(object):
 
-    def __init__(self):
+    def __init__(self, state_path=None):
         self.conns = {}  # key -> _Conn
         self.by_vid = {}  # vid -> _Conn
         self.channels = {}  # cid -> _Chan
         self.next_vid = _VIRTUAL_ID_BASE
         self.next_cid = _FIRST_USER_CHANNEL_ID
         self.ever_nicks = {}  # vid -> nick (for unban by nickname)
+        # Persistent state (saved to state_path as JSON when hosting):
+        self.state_path = state_path
+        self.state_dirty = False
+        self._last_save = 0.0
+        self.known_vids = {}  # nick.lower() -> vid (stable across sessions)
+        self.saved_rosters = {}  # vid -> (friends, ignored, muted) sets
+        self.private_history = {}  # 'vidA:vidB' -> [(time, vid, nick, group, text)]
         system = _Chan(_SYSTEM_CHANNEL_ID, _SYSTEM_CHANNEL_NAME, owner=-1, system=True)
         system.greeting = _SYSTEM_GREETING
         self.channels[system.id] = system
+        self._load_state()
+
+    # -- persistence ---------------------------------------------------------
+    # Virtual IDs are stable per nickname, so rosters, channel ownership,
+    # moderation and bans survive host restarts as-is; only live
+    # membership (who is in which channel right now) is session-local.
+
+    def _mark_dirty(self):
+        self.state_dirty = True
+
+    @staticmethod
+    def _history_from_json(rows):
+        result = []
+        for row in rows or []:
+            try:
+                when, vid, nick, group, text = row
+                result.append((float(when), int(vid), _u(nick), int(group), _u(text)))
+            except Exception:
+                continue
+        return result[-_HISTORY_LIMIT:]
+
+    def _load_state(self):
+        if not self.state_path:
+            return
+        try:
+            with open(self.state_path, 'rb') as f:
+                state = json.loads(f.read())
+        except Exception:
+            return  # no state yet (first host run) - start fresh
+        try:
+            if state.get('version') != _STATE_VERSION:
+                _log('state file %s has unsupported version, starting fresh' % self.state_path)
+                return
+            self.next_vid = max(_VIRTUAL_ID_BASE, int(state.get('nextVid', _VIRTUAL_ID_BASE)))
+            self.next_cid = max(_FIRST_USER_CHANNEL_ID, int(state.get('nextCid', _FIRST_USER_CHANNEL_ID)))
+            self.ever_nicks = dict(((int(vid), _u(nick)) for vid, nick in (state.get('everNicks') or {}).iteritems()))
+            self.known_vids = dict(((_u(nick).lower(), int(vid)) for nick, vid in (state.get('knownVids') or {}).iteritems()))
+            if self.known_vids:
+                self.next_vid = max(self.next_vid, max(self.known_vids.itervalues()))
+            for vid, rows in (state.get('rosters') or {}).iteritems():
+                self.saved_rosters[int(vid)] = (set(int(x) for x in rows.get('f') or []),
+                 set(int(x) for x in rows.get('i') or []),
+                 set(int(x) for x in rows.get('m') or []))
+            system = self.channels.get(_SYSTEM_CHANNEL_ID)
+            if system is not None:
+                system.history = self._history_from_json(state.get('systemHistory'))
+            for saved in state.get('channels') or []:
+                chan = _Chan(int(saved['id']), _u(saved.get('name', u'')),
+                             owner=int(saved.get('owner', 0)),
+                             password=_u(saved.get('password', u'')))
+                chan.greeting = _u(saved.get('greeting', u''))
+                chan.flags = int(saved.get('flags', 0))
+                chan.moderators = set(int(x) for x in saved.get('moderators') or [])
+                chan.banned = dict(((int(vid), float(end)) for vid, end in (saved.get('banned') or {}).iteritems()))
+                chan.history = self._history_from_json(saved.get('history'))
+                self.channels[chan.id] = chan
+                self.next_cid = max(self.next_cid, chan.id)
+            for key, rows in (state.get('privateHistory') or {}).iteritems():
+                self.private_history[_u(key)] = self._history_from_json(rows)
+            _log('state loaded from %s (players=%d, channels=%d, rosters=%d)' % (
+                self.state_path, len(self.known_vids),
+                len([c for c in self.channels.itervalues() if not c.system]),
+                len(self.saved_rosters)))
+        except Exception:
+            _log('failed to load state from %s, starting fresh:' % self.state_path)
+            traceback.print_exc()
+
+    def _state_dict(self):
+        cs = _cs()
+        channels = []
+        for chan in self.channels.itervalues():
+            if chan.system or chan.flags & cs.CHAT_CHANNEL_PRIVATE:
+                continue  # privates keep only their history (by vid pair)
+            channels.append({'id': chan.id,
+             'name': chan.name,
+             'owner': chan.owner,
+             'password': chan.password,
+             'greeting': chan.greeting,
+             'flags': chan.flags,
+             'moderators': sorted(chan.moderators),
+             'banned': dict(((str(vid), end) for vid, end in chan.banned.iteritems())),
+             'history': [list(row) for row in chan.history]})
+        system = self.channels.get(_SYSTEM_CHANNEL_ID)
+        return {'version': _STATE_VERSION,
+         'nextVid': self.next_vid,
+         'nextCid': self.next_cid,
+         'everNicks': dict(((str(vid), nick) for vid, nick in self.ever_nicks.iteritems())),
+         'knownVids': dict(self.known_vids),
+         'rosters': dict(((str(vid), {'f': sorted(f), 'i': sorted(i), 'm': sorted(m)})) for vid, (f, i, m) in self.saved_rosters.iteritems()),
+         'channels': channels,
+         'systemHistory': [list(row) for row in system.history] if system is not None else [],
+         'privateHistory': dict(((key, [list(row) for row in rows]) for key, rows in self.private_history.iteritems()))}
+
+    def flush_state(self, force=False):
+        if not self.state_path or not self.state_dirty:
+            return
+        now = time.time()
+        if not force and now - self._last_save < _STATE_SAVE_THROTTLE:
+            return
+        self._last_save = now
+        try:
+            payload = json.dumps(self._state_dict())
+            tmp_path = self.state_path + '.tmp'
+            with open(tmp_path, 'wb') as f:
+                f.write(payload)
+            try:
+                import os
+                if os.path.exists(self.state_path):
+                    os.remove(self.state_path)
+                os.rename(tmp_path, self.state_path)
+            except Exception:
+                with open(self.state_path, 'wb') as f:
+                    f.write(payload)
+            self.state_dirty = False
+        except Exception:
+            _log('failed to save state to %s:' % self.state_path)
+            traceback.print_exc()
+
+    def _snapshot_roster(self, conn):
+        if conn.vid:
+            self.saved_rosters[conn.vid] = (set(conn.friends), set(conn.ignored), set(conn.muted))
+            self._mark_dirty()
+
+    @staticmethod
+    def _private_key(vid_a, vid_b):
+        low, high = sorted((int(vid_a), int(vid_b)))
+        return '%d:%d' % (low, high)
 
     # -- connection lifecycle ------------------------------------------------
 
@@ -221,38 +372,66 @@ class _MPServer(object):
             return
         conn.alive = False
         if conn.vid:
+            self._snapshot_roster(conn)
             self.by_vid.pop(conn.vid, None)
             for cid in list(conn.joined):
                 chan = self.channels.get(cid)
                 if chan is not None:
                     self._remove_member(chan, conn, notify_self=False)
+            self._push_presence(conn, online=False)
+            self.flush_state(force=True)
             _log('player disconnected: %s (vid=%s)' % (_b(conn.nick), conn.vid))
+
+    def _push_presence(self, conn, online):
+        """Tell everyone who has conn in their friends list about the
+        online-status change (stock servers push this unsolicited)."""
+        cs = _cs()
+        for other in self.by_vid.itervalues():
+            if other is not conn and conn.vid in other.friends:
+                self._act(other, cs.CHAT_ACTIONS.friendStatusUpdate,
+                          data=[[self._view_id(conn.vid, other), bool(online)]])
 
     def on_hello(self, conn, nick, self_dbid):
         cs = _cs()
-        self.next_vid += 1
-        conn.vid = self.next_vid
         base = _sanitize_nick(nick) or u'Commander'
-        taken = set((c.nick for c in self.by_vid.itervalues()))
+        taken = set((c.nick.lower() for c in self.by_vid.itervalues()))
         candidate = base
         suffix = 2
-        while candidate in taken:
+        # A nickname keeps its virtual ID across sessions; only take a
+        # suffix when that nick (or its vid) is currently online, e.g.
+        # two clients started with the same configured nickname.
+        while candidate.lower() in taken or self.known_vids.get(candidate.lower()) in self.by_vid:
             candidate = u'%s_%d' % (base[:22], suffix)
             suffix += 1
+        vid = self.known_vids.get(candidate.lower())
+        if not vid:
+            self.next_vid += 1
+            vid = self.next_vid
+            self.known_vids[candidate.lower()] = vid
+        conn.vid = vid
         conn.nick = candidate
         try:
             conn.self_dbid = int(self_dbid)
         except Exception:
             conn.self_dbid = 1
+        saved = self.saved_rosters.get(conn.vid)
+        if saved is not None:
+            conn.friends, conn.ignored, conn.muted = (set(x) for x in saved)
         self.by_vid[conn.vid] = conn
         self.ever_nicks[conn.vid] = conn.nick
+        self._mark_dirty()
         conn.send({'t': 'welcome', 'vid': conn.vid, 'nick': conn.nick, 'ver': PROTO_VER})
         # System channels are pushed unsolicited, like the real server did
         # (requestID=-1 -> client stores and initializes them).
         system_data = [self._chan_data(chan, conn) for chan in self.channels.itervalues() if chan.system]
         self._act(conn, cs.CHAT_ACTIONS.requestChannels, data=system_data)
-        # An (initially empty) roster unblocks the client's message queue.
+        # The (restored) roster unblocks the client's message queue.
         self._send_roster(conn)
+        for friend_vid in sorted(conn.friends):
+            self._act(conn, cs.CHAT_ACTIONS.friendStatusUpdate,
+                      data=[[self._view_id(friend_vid, conn), friend_vid in self.by_vid]])
+        self._push_presence(conn, online=True)
+        self.flush_state(force=True)
         _log('player connected: %s (vid=%s, selfDBID=%s)' % (_b(conn.nick), conn.vid, conn.self_dbid))
 
     # -- view helpers --------------------------------------------------------
@@ -372,7 +551,9 @@ class _MPServer(object):
             other = self.by_vid.get(vid)
             if other is not None:
                 self._act(other, cs.CHAT_ACTIONS.leave, channel=chan.id, originator_vid=conn.vid)
-        if not chan.members and not chan.system and not chan.invited:
+        # Only private channels are ephemeral; user channels (and their
+        # history) persist until the owner destroys them.
+        if not chan.members and not chan.system and not chan.invited and chan.flags & cs.CHAT_CHANNEL_PRIVATE:
             self.channels.pop(chan.id, None)
 
     def _add_member(self, chan, conn):
@@ -450,6 +631,8 @@ class _MPServer(object):
                 self.channels[chan.id] = chan
                 self._act(conn, A.createChannel, channel=chan.id,
                           data=self._chan_data(chan, conn), requestID=req)
+                self._mark_dirty()
+                self.flush_state(force=True)
                 _log('channel created: %s #%s by %s' % (_b(name), chan.id, _b(conn.nick)))
         elif cmd == C.enterChatChannel:
             chan = self.channels.get(chan_id)
@@ -484,6 +667,8 @@ class _MPServer(object):
                     if member is not None:
                         member.joined.discard(chan.id)
                         self._act(member, A.channelDestroyed, channel=chan.id, originator_vid=conn.vid)
+                self._mark_dirty()
+                self.flush_state(force=True)
                 _log('channel destroyed: %s #%s' % (_b(chan.name), chan.id))
         elif cmd == C.broadcast:
             chan = self.channels.get(chan_id)
@@ -503,6 +688,11 @@ class _MPServer(object):
                 chan.history.append((time.time(), conn.vid, conn.nick, group, s1))
                 if len(chan.history) > _HISTORY_LIMIT:
                     chan.history = chan.history[-_HISTORY_LIMIT:]
+                if chan.flags & cs.CHAT_CHANNEL_PRIVATE:
+                    parties = sorted(v for v in chan.members | chan.invited | {chan.owner} if v)
+                    if len(parties) == 2:
+                        self.private_history[self._private_key(*parties)] = list(chan.history)
+                self._mark_dirty()
                 for vid in list(chan.members):
                     member = self.by_vid.get(vid)
                     if member is not None:
@@ -537,6 +727,7 @@ class _MPServer(object):
             name = target.nick if target is not None else (s1 or self.ever_nicks.get(target_vid, u'Unknown'))
             if target is not None:
                 self.ever_nicks[target_vid] = target.nick
+            is_new_friend = cmd == C.addFriend and target_vid not in conn.friends
             if cmd == C.addFriend:
                 conn.friends.add(target_vid)
                 conn.ignored.discard(target_vid)
@@ -548,10 +739,22 @@ class _MPServer(object):
             else:
                 conn.muted.add(target_vid)
                 action = A.setMuted
+            self._snapshot_roster(conn)
             self._act(conn, action, data=[self._view_id(target_vid, conn), name, 0], requestID=req)
             if cmd == C.addFriend:
                 self._act(conn, A.friendStatusUpdate,
                           data=[[self._view_id(target_vid, conn), target_vid in self.by_vid]])
+                if is_new_friend and target is not None and target is not conn:
+                    # Stock rosters are one-sided and silent; on a friend
+                    # server the added player deserves a service-channel
+                    # notification ("you were added to friends").
+                    self._act(target, A.personalSysMessage, originator_vid=conn.vid, data={
+                     'messageID': int(time.time() * 1000),
+                     'user_id': self._view_id(target.vid, target),
+                     'type': cs.SYS_MESSAGE_TYPE.adminTextMessage.index(),
+                     'importance': cs.SYS_MESSAGE_IMPORTANCE.normal.index(),
+                     'active': True,
+                     'data': u'Игрок %s добавил вас в список друзей.' % conn.nick})
         elif cmd in (C.removeFriend, C.removeIgnored, C.unsetMuted):
             target_vid = self._translate_incoming_id(conn, i64)
             if cmd == C.removeFriend:
@@ -563,6 +766,7 @@ class _MPServer(object):
             else:
                 conn.muted.discard(target_vid)
                 action = A.unsetMuted
+            self._snapshot_roster(conn)
             self._act(conn, action, data=self._view_id(target_vid, conn), requestID=req)
         elif cmd == C.createPrivate:
             target_vid = self._translate_incoming_id(conn, i64)
@@ -582,7 +786,11 @@ class _MPServer(object):
                     chan = _Chan(self.next_cid, target.nick, owner=conn.vid)
                     chan.flags |= cs.CHAT_CHANNEL_PRIVATE
                     chan.invited.add(target_vid)
+                    # Restore the previous conversation with this player.
+                    chan.history = list(self.private_history.get(
+                        self._private_key(conn.vid, target_vid), []))
                     self.channels[chan.id] = chan
+                    self._mark_dirty()
                 self._act(conn, A.requestChannels, data=[self._chan_data(chan, conn)])
                 self._act(target, A.requestChannels, data=[self._chan_data(chan, target)])
                 if conn.vid not in chan.members:
@@ -622,6 +830,7 @@ class _MPServer(object):
                 chan.name = new_name
             else:
                 chan.greeting = s1
+            self._mark_dirty()
             for vid in list(chan.members):
                 member = self.by_vid.get(vid)
                 if member is not None:
@@ -637,6 +846,7 @@ class _MPServer(object):
             for vid, nick in list(self.ever_nicks.iteritems()):
                 if nick.lower() == s1.lower():
                     chan.banned.pop(vid, None)
+            self._mark_dirty()
             return
         if target is None:
             self._fail(conn, A.userChatCommand, R.userNotExists, channel=chan.id, requestID=req)
@@ -649,6 +859,7 @@ class _MPServer(object):
                 chan.moderators.add(target.vid)
             else:
                 chan.moderators.discard(target.vid)
+            self._mark_dirty()
             return
         if cmd == C.BAN:
             if not is_mod or target.vid == chan.owner:
@@ -656,6 +867,7 @@ class _MPServer(object):
                 return
             minutes = int(i16)
             chan.banned[target.vid] = -1 if minutes < 0 else time.time() + minutes * 60
+            self._mark_dirty()
             if target.vid in chan.members:
                 self._remove_member(chan, target)
             _log('banned %s in #%s for %s min (%s)' % (_b(target.nick), chan.id, minutes, _b(s2)))
@@ -788,7 +1000,7 @@ class _Transport(object):
 
     def _become_host(self):
         if self.server is None:
-            self.server = _MPServer()
+            self.server = _MPServer(self.cfg.get('_state_path'))
         if self.listen_sock is None:
             sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -840,6 +1052,8 @@ class _Transport(object):
     def tick(self):
         if self.state == 'off':
             return
+        if self.server is not None:
+            self.server.flush_state()
         now = time.time()
         rlist = []
         if self.udp_sock is not None:
@@ -1291,6 +1505,22 @@ def _install_patches(state):
         BWChatProvider._BWChatProvider__sendAction = _mp_send_action
     except Exception:
         _log('BWChatProvider patch failed (player search will not work):')
+        traceback.print_exc()
+
+    try:
+        # Stock lazy-channel controllers (the system "common" channel)
+        # swallow the new-message notification: their addMessage always
+        # returns True, so LobbyEntry never asks the carousel to blink
+        # the channel button. Report activity like regular channels do.
+        from messenger.gui.Scaleform.channels.bw.lobby_controllers import LazyChannelController
+
+        def _mp_lazy_add_message(self, message, doFormatting=True):
+            return super(LazyChannelController, self).addMessage(message, doFormatting)
+
+        LazyChannelController.addMessage = _mp_lazy_add_message
+        _log('lazy channel new-message highlight patch applied')
+    except Exception:
+        _log('lazy channel highlight patch failed (non-fatal):')
         traceback.print_exc()
 
     _PATCHED = True
