@@ -45,6 +45,7 @@ _PREBATTLE_SECONDS = 10
 _LOAD_TIMEOUT = 120.0
 _SAMPLE_PERIOD = 0.1
 _POSE_HEARTBEAT = 0.5
+_SIM_PERIOD = 0.05
 _SPAWN_WAIT_TIMEOUT = 90.0
 
 # Avatar._MOVEMENT_FLAGS (scripts/client/Avatar.py)
@@ -102,6 +103,152 @@ def _dirs_from_flags(flags):
 def _yaw_to_point(x, z, tx, tz):
     """BigWorld yaw (0 faces +Z) that looks from (x,z) toward (tx,tz)."""
     return math.atan2(tx - x, tz - z)
+
+
+class _AimTarget(object):
+    """Turret/gun matrix pair handed to CompoundAppearance.
+
+    Mirrors the attribute shape of WGVehicleFilter that
+    ``setupGunMatrixTargets`` reads (``target.turretMatrix`` /
+    ``target.gunMatrix``): the stock filter matrices never move
+    without a server pose stream, so the sim writes these instead.
+    """
+
+    def __init__(self):
+        import Math
+        self.turretMatrix = Math.Matrix()
+        self.turretMatrix.setIdentity()
+        self.gunMatrix = Math.Matrix()
+        self.gunMatrix.setIdentity()
+
+
+class _VehiclePose(object):
+    """Python-integrated pose + stock presentation for one Vehicle.
+
+    Serverless WGVehiclePhysics produces no motion (the retail
+    filter expects game-server pose samples), and the native entity
+    transform is read-only.  The battle client therefore integrates
+    a simple kinematic pose per vehicle and publishes it through a
+    Math matrix provider wired into the stock CompoundAppearance
+    (model root, swinging animator, LOD position, gun targets) -
+    the same presentation boundary the 0.9.22 offline-battles
+    research uses.  A MatrixAnimation keyframed between sim ticks
+    smooths the 20 Hz updates when the build provides one.
+    """
+
+    _anim_available = None
+
+    def __init__(self, pos, yaw):
+        import Math
+        self.x = float(pos[0])
+        self.y = float(pos[1])
+        self.z = float(pos[2])
+        self.yaw = float(yaw)
+        self.pitch = 0.0
+        self.roll = 0.0
+        self.speed = 0.0
+        self.input = (0, 0)
+        self.attached = False
+        self.attach_fails = 0
+        self.grounded_once = False
+        self.on_model_changed = None
+        # Kinematic parameters (filled from the type descriptor).
+        self.speed_fwd = 12.0
+        self.speed_back = 4.0
+        self.traverse = 0.6
+        self.half_len = 3.0
+        self.half_wid = 1.5
+        self.gun_limits = None
+        # Presentation providers.
+        self.matrix = Math.Matrix()
+        self._write_matrix(self.matrix)
+        if _VehiclePose._anim_available is None:
+            _VehiclePose._anim_available = callable(
+                getattr(Math, 'MatrixAnimation', None))
+            _log('Math.MatrixAnimation available: %s'
+                 % (_VehiclePose._anim_available,))
+        self.animation = None
+        self._key_from = None
+        self._key_to = None
+        if _VehiclePose._anim_available:
+            try:
+                self.animation = Math.MatrixAnimation()
+                self._key_from = Math.Matrix(self.matrix)
+                self._key_to = Math.Matrix(self.matrix)
+                self.animation.keyframes = ((0.0, self._key_from),
+                                            (0.001, self._key_to))
+                self.animation.time = 0.0
+            except Exception:
+                self.animation = None
+        self.provider = self.animation if self.animation is not None \
+            else self.matrix
+        self._prev_pose = (self.x, self.y, self.z,
+                           self.yaw, self.pitch, self.roll)
+        self.aim = _AimTarget()
+        self._aim_yaw_written = None
+        self._aim_pitch_written = None
+
+    def _write_matrix(self, matrix, pose=None):
+        if pose is None:
+            pose = (self.x, self.y, self.z,
+                    self.yaw, self.pitch, self.roll)
+        matrix.setRotateYPR((pose[3], pose[4], pose[5]))
+        matrix.translation = (pose[0], pose[1], pose[2])
+
+    def snapshot(self):
+        self._prev_pose = (self.x, self.y, self.z,
+                           self.yaw, self.pitch, self.roll)
+
+    def publish(self, dt):
+        """Write the current pose into the matrix providers."""
+        self._write_matrix(self.matrix)
+        if self.animation is not None:
+            try:
+                self._write_matrix(self._key_from, self._prev_pose)
+                self._write_matrix(self._key_to)
+                self.animation.keyframes = (
+                    (0.0, self._key_from),
+                    (max(float(dt), 0.001), self._key_to))
+                self.animation.time = 0.0
+            except Exception:
+                self.animation = None
+                self.provider = self.matrix
+
+    def set_aim(self, turret_yaw, gun_pitch):
+        turret_yaw = float(turret_yaw)
+        gun_pitch = float(gun_pitch)
+        if turret_yaw != self._aim_yaw_written:
+            self.aim.turretMatrix.setRotateYPR((turret_yaw, 0.0, 0.0))
+            self._aim_yaw_written = turret_yaw
+        if gun_pitch != self._aim_pitch_written:
+            self.aim.gunMatrix.setRotateYPR((0.0, gun_pitch, 0.0))
+            self._aim_pitch_written = gun_pitch
+
+
+def _fill_pose_params(pose, descr):
+    """Best-effort kinematic parameters from a VehicleDescr."""
+    try:
+        limits = descr.type.speedLimits
+        pose.speed_fwd = max(1.0, float(limits[0]))
+        pose.speed_back = max(0.5, float(limits[1]))
+    except Exception:
+        pass
+    try:
+        pose.traverse = max(0.05, float(descr.chassis.rotationSpeed))
+    except Exception:
+        pass
+    try:
+        bbox = descr.chassis.hitTester.bbox
+        pose.half_len = min(5.0, max(
+            1.5, abs(float(bbox[1][2]) - float(bbox[0][2])) * 0.5))
+        pose.half_wid = min(2.5, max(
+            0.8, abs(float(bbox[1][0]) - float(bbox[0][0])) * 0.5))
+    except Exception:
+        pass
+    try:
+        pose.gun_limits = descr.gun.pitchLimits['absolute']
+    except Exception:
+        pose.gun_limits = None
 
 
 def _vehicle_info_row(vehicle_id, comp_descr, name, team, account_dbid,
@@ -306,8 +453,11 @@ class _BattleServer(object):
                      'r': int(msg.get('r', 0) or 0),
                      'g': int(msg.get('g', 0) or 0)}
             pos = msg.get('p')
-            if isinstance(pos, (list, tuple)) and len(pos) == 3:
-                relay['p'] = [float(pos[0]), float(pos[1]), float(pos[2])]
+            if isinstance(pos, (list, tuple)) and len(pos) >= 3:
+                relay['p'] = [float(pos[0]), float(pos[1]),
+                              float(pos[2])]
+                if len(pos) > 3:
+                    relay['p'].append(float(pos[3]))
             self._broadcast(battle, exclude_vid=conn.vid, **relay)
             return
         if battle is None:
@@ -472,6 +622,10 @@ class _BattleClient(object):
         self._period_state = None
         self._period_ticking = False
         self._script_input_probe = None
+        self._poses = {}           # vid -> _VehiclePose
+        self._sim_last = 0.0
+        self._sim_dead = False
+        self._targeting_sent = False
 
     # -- transport --------------------------------------------------------
 
@@ -532,11 +686,13 @@ class _BattleClient(object):
         vehicle = BigWorld.entity(entity_id)
         if vehicle is None:
             return
-        try:
-            vehicle.filter.notifyInputKeysDown(int(msg.get('m', 0) or 0),
-                                               int(msg.get('r', 0) or 0))
-        except Exception:
-            pass
+        pose = self._poses.get(vid)
+        if pose is not None:
+            # The kinematic sim integrates every vehicle from its
+            # driver's replicated input; the native filter receives
+            # no server pose samples offline and stays unused.
+            pose.input = (int(msg.get('m', 0) or 0),
+                          int(msg.get('r', 0) or 0))
         packed = int(msg.get('g', 0) or 0)
         try:
             prev = vehicle.gunAnglesPacked
@@ -547,34 +703,48 @@ class _BattleClient(object):
                     notifier(prev)
         except Exception:
             pass
-        pos = msg.get('p')
-        if pos and not self._pose_unsupported:
+        if pose is not None and pose.gun_limits is not None:
             try:
-                cur = vehicle.position
-                dx = float(pos[0]) - float(cur[0])
-                dz = float(pos[2]) - float(cur[2])
-                if dx * dx + dz * dz > 16.0:
-                    import Math
-                    vehicle.position = Math.Vector3(float(pos[0]),
-                                                    float(pos[1]),
-                                                    float(pos[2]))
-                    _log('pose snap for vid %s (drift %.1fm)'
-                         % (vid, math.sqrt(dx * dx + dz * dz)))
-            except Exception:
-                self._pose_unsupported = True
-                _log('entity.position is not writable - pose snap disabled')
-
-    def _ev_left(self, msg):
-        entity_id = self._vehicles.get(int(msg.get('vid', 0) or 0))
-        if not entity_id:
-            return
-        import BigWorld
-        vehicle = BigWorld.entity(entity_id)
-        if vehicle is not None:
-            try:
-                vehicle.filter.notifyInputKeysDown(0, 0)
+                import gun_rotation_shared
+                turret_yaw, gun_pitch = \
+                    gun_rotation_shared.decodeGunAngles(
+                        packed, pose.gun_limits)
+                pose.set_aim(turret_yaw, gun_pitch)
             except Exception:
                 pass
+        pos = msg.get('p')
+        if pos and pose is not None:
+            try:
+                ax = float(pos[0])
+                az = float(pos[2])
+                dx = ax - pose.x
+                dz = az - pose.z
+                dist2 = dx * dx + dz * dz
+                if dist2 > 36.0:
+                    pose.x = ax
+                    pose.z = az
+                    pose.y = float(pos[1])
+                    if len(pos) > 3:
+                        pose.yaw = float(pos[3])
+                    pose.grounded_once = False
+                    pose.snapshot()
+                    _log('pose snap for vid %s (drift %.1fm)'
+                         % (vid, math.sqrt(dist2)))
+                elif dist2 > 0.04:
+                    pose.x += dx * 0.5
+                    pose.z += dz * 0.5
+                    if len(pos) > 3:
+                        dyaw = (float(pos[3]) - pose.yaw + math.pi) \
+                            % (2.0 * math.pi) - math.pi
+                        pose.yaw += dyaw * 0.5
+            except Exception:
+                pass
+
+    def _ev_left(self, msg):
+        vid = int(msg.get('vid', 0) or 0)
+        pose = self._poses.get(vid)
+        if pose is not None:
+            pose.input = (0, 0)
 
     def _ev_abort(self, msg):
         if self.active:
@@ -801,6 +971,8 @@ class _BattleClient(object):
             self._teardown()
             return
         BigWorld.callback(_SAMPLE_PERIOD, self._sample)
+        self._sim_last = time.time()
+        BigWorld.callback(_SIM_PERIOD, self._sim_tick)
 
     def _vehicle_props(self, comp_descr_bytes, name, team):
         from items import vehicles
@@ -862,6 +1034,13 @@ class _BattleClient(object):
                 'Vehicle', self._space_id, 0,
                 (spawn[0], y + 1.0, spawn[1]), (0.0, 0.0, yaw), props)
             self._vehicles[vid] = entity_id
+            try:
+                pose = _VehiclePose((spawn[0], y + 1.0, spawn[1]), yaw)
+                _fill_pose_params(pose, descr)
+                self._poses[vid] = pose
+            except Exception:
+                _log('pose init failed for vid %s:' % (vid,))
+                traceback.print_exc()
             _MP_VEHICLE_BRIDGES[entity_id] = self._bridge
             try:
                 vehicle = BigWorld.entities[entity_id]
@@ -922,7 +1101,13 @@ class _BattleClient(object):
                 world_draw = '?'
             own_pos = None
             try:
-                if own is not None:
+                sim_pose = self._poses.get(
+                    int(getattr(self.state, 'my_vid', 0) or 0))
+                if sim_pose is not None:
+                    own_pos = '(%.1f,%.1f v=%.1f att=%s)' % (
+                        sim_pose.x, sim_pose.z, sim_pose.speed,
+                        sim_pose.attached)
+                elif own is not None:
                     p = own.position
                     own_pos = '(%.1f,%.1f)' % (p[0], p[2])
             except Exception:
@@ -1135,16 +1320,11 @@ class _BattleClient(object):
                 packed = 0
         now = time.time()
         pose = None
-        own_id = self._vehicles.get(
+        own_pose = self._poses.get(
             int(getattr(self.state, 'my_vid', 0) or 0))
-        if own_id and now - self._last_pose_sent >= _POSE_HEARTBEAT:
-            vehicle = BigWorld.entity(own_id)
-            if vehicle is not None:
-                try:
-                    pos = vehicle.position
-                    pose = [float(pos[0]), float(pos[1]), float(pos[2])]
-                except Exception:
-                    pose = None
+        if own_pose is not None and \
+                now - self._last_pose_sent >= _POSE_HEARTBEAT:
+            pose = [own_pose.x, own_pose.y, own_pose.z, own_pose.yaw]
         current = (self._cur_input[0], self._cur_input[1], packed)
         if current != self._last_sent or pose is not None:
             msg = {'cmd': 'input', 'm': current[0], 'r': current[1],
@@ -1155,6 +1335,324 @@ class _BattleClient(object):
             self._send(**msg)
             self._last_sent = current
 
+    # -- kinematic sim + presentation --------------------------------------
+    # Serverless native physics never produces pose samples, so the
+    # battle integrates simple kinematic poses (descriptor speed
+    # limits / hull traverse, terrain following via collide) for
+    # every vehicle from replicated driver input, and publishes
+    # them through matrix providers wired into the stock appearance
+    # and - for the own vehicle - into the camera matrix chain.
+
+    def _sim_tick(self):
+        if not self.active or self._tearing_down:
+            return
+        import BigWorld
+        BigWorld.callback(_SIM_PERIOD, self._sim_tick)
+        if self._sim_dead:
+            return
+        try:
+            self._sim_step()
+        except Exception:
+            self._sim_dead = True
+            _log('kinematic sim disabled after error:')
+            traceback.print_exc()
+
+    def _sim_step(self):
+        now = time.time()
+        dt = now - self._sim_last
+        self._sim_last = now
+        if dt <= 0.0:
+            dt = _SIM_PERIOD
+        elif dt > 0.25:
+            dt = 0.25
+        avatar = self._avatar
+        period = 0
+        if avatar is not None:
+            arena = getattr(avatar, 'arena', None)
+            period = int(getattr(arena, 'period', 0) or 0)
+        can_drive = (period == 3)
+        my_vid = int(getattr(self.state, 'my_vid', 0) or 0)
+        for vid, pose in list(self._poses.iteritems()):
+            if vid == my_vid:
+                pose.input = self._cur_input
+            if not pose.attached and pose.attach_fails < 3:
+                self._try_attach_pose(vid, pose)
+            if pose.attached and getattr(pose, '_bound_provider',
+                                         None) is not pose.provider:
+                self._rebind_pose(vid, pose)
+            pose.snapshot()
+            move, rotate = pose.input if can_drive else (0, 0)
+            self._integrate_pose(pose, move, rotate, dt)
+            pose.publish(dt)
+        own_pose = self._poses.get(my_vid)
+        if own_pose is not None and own_pose.attached \
+                and avatar is not None:
+            self._drive_own_aim(own_pose)
+            self._reassert_own_binding(own_pose)
+
+    def _integrate_pose(self, pose, move, rotate, dt):
+        if move > 0:
+            target = pose.speed_fwd
+        elif move < 0:
+            target = -pose.speed_back
+        else:
+            target = 0.0
+        # Engine-like approach: reach top speed in ~2.5 s, brake or
+        # coast down faster.  A stand-in for the retail powertrain,
+        # plausible across vehicle classes.
+        if target != 0.0 and (pose.speed == 0.0 or
+                              (target > 0) == (pose.speed > 0)):
+            rate = max(2.0, pose.speed_fwd * 0.4)
+        else:
+            rate = max(4.0, pose.speed_fwd * 0.8)
+        delta = target - pose.speed
+        step = rate * dt
+        if delta > step:
+            delta = step
+        elif delta < -step:
+            delta = -step
+        pose.speed += delta
+        if rotate:
+            turn = float(rotate)
+            if pose.speed < -0.1:
+                turn = -turn
+            pose.yaw = (pose.yaw + turn * pose.traverse * dt
+                        + math.pi) % (2.0 * math.pi) - math.pi
+        if pose.speed != 0.0:
+            pose.x += math.sin(pose.yaw) * pose.speed * dt
+            pose.z += math.cos(pose.yaw) * pose.speed * dt
+        if pose.speed != 0.0 or rotate or not pose.grounded_once:
+            self._ground_pose(pose)
+
+    def _ground_pose(self, pose):
+        center_y = self._terrain_y(pose.x, pose.z)
+        if center_y is None:
+            return
+        pose.y = center_y + 1.0
+        sin_y = math.sin(pose.yaw)
+        cos_y = math.cos(pose.yaw)
+        front = self._terrain_y(pose.x + sin_y * pose.half_len,
+                                pose.z + cos_y * pose.half_len)
+        back = self._terrain_y(pose.x - sin_y * pose.half_len,
+                               pose.z - cos_y * pose.half_len)
+        right = self._terrain_y(pose.x + cos_y * pose.half_wid,
+                                pose.z - sin_y * pose.half_wid)
+        left = self._terrain_y(pose.x - cos_y * pose.half_wid,
+                               pose.z + sin_y * pose.half_wid)
+        if front is not None and back is not None:
+            pose.pitch = math.atan2(front - back,
+                                    2.0 * pose.half_len)
+        if right is not None and left is not None:
+            pose.roll = math.atan2(right - left,
+                                   2.0 * pose.half_wid)
+        pose.grounded_once = True
+
+    def _try_attach_pose(self, vid, pose):
+        import BigWorld
+        entity_id = self._vehicles.get(vid)
+        if not entity_id:
+            return
+        vehicle = BigWorld.entity(entity_id)
+        if vehicle is None:
+            return
+        appearance = getattr(vehicle, 'appearance', None)
+        if appearance is None:
+            return
+        if getattr(appearance, 'compoundModel', None) is None:
+            return
+        try:
+            self._apply_presentation(vehicle, appearance, pose)
+        except Exception:
+            pose.attach_fails += 1
+            _log('pose attach failed vid=%s (attempt %s):'
+                 % (vid, pose.attach_fails))
+            traceback.print_exc()
+            return
+        pose.attached = True
+        pose.publish(_SIM_PERIOD)
+        _log('pose presentation attached vid=%s entity=%s anim=%s'
+             % (vid, entity_id, pose.animation is not None))
+        changed = getattr(appearance, 'onModelChanged', None)
+        if changed is not None:
+            def _on_model_changed(bc=self, v=vid, p=pose):
+                import BigWorld
+                # Deferred: stock __onModelsRefresh rebinds its own
+                # providers synchronously AFTER firing this event.
+                BigWorld.callback(0.0, lambda: bc._rebind_pose(v, p))
+            try:
+                changed += _on_model_changed
+                pose.on_model_changed = _on_model_changed
+            except Exception:
+                pass
+        if vid == int(getattr(self.state, 'my_vid', 0) or 0):
+            self._bind_own_matrices(pose)
+
+    def _rebind_pose(self, vid, pose):
+        if not self.active or self._tearing_down:
+            return
+        import BigWorld
+        entity_id = self._vehicles.get(vid)
+        vehicle = BigWorld.entity(entity_id) if entity_id else None
+        if vehicle is None:
+            return
+        appearance = getattr(vehicle, 'appearance', None)
+        if appearance is None:
+            return
+        try:
+            self._apply_presentation(vehicle, appearance, pose)
+            if vid == int(getattr(self.state, 'my_vid', 0) or 0):
+                self._bind_own_matrices(pose)
+        except Exception:
+            _log('pose rebind failed vid=%s:' % (vid,))
+            traceback.print_exc()
+
+    def _apply_presentation(self, vehicle, appearance, pose):
+        model = getattr(appearance, 'compoundModel', None)
+        if model is None:
+            model = getattr(vehicle, 'model', None)
+        if model is None:
+            raise RuntimeError('no compound model yet')
+        model.matrix = pose.provider
+        swinging = getattr(appearance, 'swingingAnimator', None)
+        if swinging is not None:
+            import Math
+            identity = Math.Matrix()
+            identity.setIdentity()
+            swinging.placingCompensationMatrix = identity
+            swinging.worldMatrix = pose.provider
+        lod = getattr(appearance, 'lodCalculator', None)
+        if lod is not None:
+            try:
+                import DataLinks
+                lod.setupPosition(
+                    DataLinks.linkMatrixTranslation(pose.provider))
+            except Exception:
+                pass
+        setup = getattr(appearance, 'setupGunMatrixTargets', None)
+        if callable(setup):
+            setup(pose.aim)
+        pose._bound_provider = pose.provider
+
+    def _bind_own_matrices(self, pose):
+        avatar = self._avatar
+        if avatar is None:
+            return
+        try:
+            matrices = avatar.consistentMatrices
+            matrices.attachedVehicleMatrix.target = pose.provider
+            matrices.ownVehicleMatrix.target = pose.provider
+            try:
+                matrices.onVehicleMatrixBindingChanged(False)
+            except Exception:
+                pass
+        except Exception:
+            _log('consistentMatrices bind failed:')
+            traceback.print_exc()
+        try:
+            stab = getattr(avatar,
+                           '_PlayerAvatar__ownVehicleStabMProv', None)
+            if stab is not None:
+                stab.target = pose.provider
+        except Exception:
+            _log('ownVehicleStabMProv bind failed:')
+            traceback.print_exc()
+        try:
+            handler = getattr(avatar, 'inputHandler', None)
+            calc = getattr(handler, 'steadyVehicleMatrixCalculator',
+                           None)
+            relink = getattr(calc, 'relinkSources', None)
+            if callable(relink):
+                relink()
+        except Exception:
+            _log('steadyVehicleMatrixCalculator relink failed:')
+            traceback.print_exc()
+        _log('own-vehicle camera matrices bound to pose provider')
+
+    def _reassert_own_binding(self, pose):
+        avatar = self._avatar
+        if avatar is None:
+            return
+        try:
+            matrices = avatar.consistentMatrices
+            if matrices.attachedVehicleMatrix.target is not \
+                    pose.provider or \
+                    matrices.ownVehicleMatrix.target is not \
+                    pose.provider:
+                self._bind_own_matrices(pose)
+        except Exception:
+            pass
+
+    def _drive_own_aim(self, pose):
+        avatar = self._avatar
+        rotator = getattr(avatar, 'gunRotator', None)
+        if rotator is None:
+            return
+        if not self._targeting_sent:
+            self._send_targeting_info()
+        try:
+            if getattr(rotator, '_VehicleGunRotator__timerID',
+                       None) is None:
+                rotator.start()
+        except Exception:
+            pass
+        try:
+            pose.set_aim(rotator.turretYaw, rotator.gunPitch)
+        except Exception:
+            pass
+
+    def _send_targeting_info(self):
+        # Retail servers call PlayerAvatar.updateTargetingInfo right
+        # after spawn; it is the only stock path that gives the gun
+        # rotator its traverse speeds and starts its tick.  Without
+        # it turretYaw/gunPitch stay at (0, 0) forever (tests #13-14).
+        avatar = self._avatar
+        descr = getattr(self, '_own_descr', None)
+        if avatar is None or descr is None:
+            return
+        turret_speed = 0.7
+        try:
+            turret_speed = float(descr.turret.rotationSpeed) or 0.7
+        except Exception:
+            pass
+        gun_speed = turret_speed
+        try:
+            gun_speed = float(descr.gun.rotationSpeed) or turret_speed
+        except Exception:
+            pass
+        aiming_time = 2.0
+        try:
+            aiming_time = float(descr.gun.aimingTime) or 2.0
+        except Exception:
+            pass
+        gun_factor = 0.1
+        try:
+            factors = descr.gun.shotDispersionFactors
+            if isinstance(factors, dict):
+                gun_factor = float(factors.get('turretRotation', 0.1))
+            else:
+                gun_factor = float(factors[0])
+        except Exception:
+            pass
+        move_factor = 0.2
+        rot_factor = 0.2
+        try:
+            factors = descr.chassis.shotDispersionFactors
+            move_factor = float(factors[0])
+            rot_factor = float(factors[1])
+        except Exception:
+            pass
+        self._targeting_sent = True
+        try:
+            avatar.updateTargetingInfo(0.0, 0.0, turret_speed,
+                                       gun_speed, 1.0, gun_factor,
+                                       move_factor, rot_factor,
+                                       aiming_time)
+            _log('updateTargetingInfo sent (turret %.2f rad/s) - '
+                 'gun rotator should be live' % (turret_speed,))
+        except Exception:
+            _log('updateTargetingInfo failed:')
+            traceback.print_exc()
+
     # -- teardown -----------------------------------------------------------
 
     def _teardown(self):
@@ -1163,6 +1661,7 @@ class _BattleClient(object):
         self._tearing_down = True
         import BigWorld
         _log('tearing down battle, returning to hangar')
+        self._poses = {}
         # Promote the hangar Account FIRST, while the Avatar entity is
         # still alive: the engine demotes the Avatar, whose stock
         # onBecomeNonPlayer stops the battle GUI session, destroys the

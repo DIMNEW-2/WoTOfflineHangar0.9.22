@@ -336,13 +336,49 @@ class _FakeVehicle(object):
         _notifier_calls.append(prev)
 
 
+class _FakePose(object):
+
+    def __init__(self):
+        self.input = (0, 0)
+        self.gun_limits = None
+        self.aim = None
+        self.x = 0.0
+        self.y = 0.0
+        self.z = 0.0
+        self.yaw = 0.0
+
+    def set_aim(self, yaw, pitch):
+        self.aim = (yaw, pitch)
+
+
 fake_veh = _FakeVehicle()
 _bw_entities[555] = fake_veh
 bc._vehicles[200] = 555
+fake_pose = _FakePose()
+bc._poses[200] = fake_pose
 bc._ev_input({'ev': 'input', 'vid': 200, 'm': -1, 'r': 1, 'g': 909})
-check(_filter_calls == [(-1, 1)], 'remote input drives vehicle filter')
+check(fake_pose.input == (-1, 1), 'remote input feeds kinematic pose')
 check(fake_veh.gunAnglesPacked == 909 and _notifier_calls == [5],
       'remote gun angles applied with notifier(prev)')
+
+# kinematic integration (no space loaded: terrain sampling no-ops)
+sp = _FakePose()
+sp.pitch = sp.roll = 0.0
+sp.speed = 0.0
+sp.speed_fwd = 10.0
+sp.speed_back = 3.0
+sp.traverse = 0.5
+sp.half_len = 3.0
+sp.half_wid = 1.5
+sp.grounded_once = True
+for _i in range(60):
+    bc._integrate_pose(sp, 1, 0, 0.05)
+check(sp.speed > 9.9 and sp.z > 5.0 and abs(sp.x) < 0.001,
+      'sim accelerates forward along +Z at yaw 0')
+for _i in range(40):
+    bc._integrate_pose(sp, 0, 1, 0.05)
+check(sp.speed == 0.0 and sp.yaw > 0.9,
+      'sim pivot-turns right and coasts to a stop')
 
 # client sampler
 bc.active = True
