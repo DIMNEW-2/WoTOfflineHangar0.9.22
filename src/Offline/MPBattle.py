@@ -612,6 +612,9 @@ class _BattleClient(object):
         yaw = _yaw_to_point(spawn[0], spawn[1],
                             *self._arena_center(arena_type))
 
+        # From here on every Vehicle is one of ours: engage the
+        # filter-sync proxy scoping (see _BATTLE_ACTIVE).
+        _BATTLE_ACTIVE[0] = True
         self._space_id = BigWorld.createSpace()
         self._mapping_id = BigWorld.addSpaceGeometryMapping(
             self._space_id, None, 'spaces/' + arena_type.geometryName)
@@ -850,11 +853,15 @@ class _BattleClient(object):
                 'Vehicle', self._space_id, 0,
                 (spawn[0], y + 1.0, spawn[1]), (0.0, 0.0, yaw), props)
             self._vehicles[vid] = entity_id
+            _MP_VEHICLE_BRIDGES[entity_id] = self._bridge
             try:
                 vehicle = BigWorld.entities[entity_id]
                 vehicle._mpFakeServer = self._bridge
             except Exception:
-                pass
+                _log('vehicle entity %s not reachable via '
+                     'BigWorld.entities yet - bridge registered by id'
+                     % (entity_id,))
+                traceback.print_exc()
             if vid == my_vid:
                 own_entity_id = entity_id
                 self._gun_limits = descr.gun.pitchLimits['absolute']
@@ -1086,6 +1093,7 @@ class _BattleClient(object):
                 BigWorld.destroyEntity(entity_id)
             except Exception:
                 pass
+            _MP_VEHICLE_BRIDGES.pop(entity_id, None)
         self._vehicles = {}
         if self._avatar_id:
             try:
@@ -1129,6 +1137,7 @@ class _BattleClient(object):
                 BigWorld.callback(0.3, self._restore_lobby)
             except Exception:
                 self._restore_lobby()
+        _BATTLE_ACTIVE[0] = False
         self._tearing_down = False
         _log('back in hangar')
 
@@ -1285,10 +1294,12 @@ def _install_avatar_patch():
                            None)
     if orig_set_aux is not None:
         def _set_aux_physics(self, prev):
-            try:
-                is_battle = orig_getattribute(self, '_mpBattle')
-            except AttributeError:
-                is_battle = False
+            is_battle = _BATTLE_ACTIVE[0]
+            if not is_battle:
+                try:
+                    is_battle = bool(orig_getattribute(self, '_mpBattle'))
+                except AttributeError:
+                    is_battle = False
             if not is_battle:
                 return orig_set_aux(self, prev)
             vehicle = None
@@ -1348,6 +1359,20 @@ class _VehicleFilterSyncProxy(object):
         return None
 
 
+# True between battle enter and teardown. The filter-sync proxy must
+# engage for every Vehicle in that window: detecting "our" vehicles
+# via an attribute stamped at spawn proved unreliable (real-client
+# test 2026-10-18 #8: _mpFakeServer was missing at startVisual time,
+# the proxy never engaged and native filter.syncGunAngles killed
+# the client inside Vehicle.__startWGPhysics). Offline there are no
+# other battle vehicles, and the hangar never sets this flag.
+_BATTLE_ACTIVE = [False]
+
+# entity id -> _FakeServer bridge, for Vehicle base/cell routing
+# without depending on attribute storage on engine entities.
+_MP_VEHICLE_BRIDGES = {}
+
+
 # Vehicle entities currently inside a stock call that must see the
 # sync-swallowing filter proxy (see _install_vehicle_patch).
 _FILTER_SCOPED = []
@@ -1374,6 +1399,13 @@ def _install_vehicle_patch():
     orig_getattribute = Vehicle.__getattribute__
 
     def _is_mp_vehicle(vehicle):
+        if _BATTLE_ACTIVE[0]:
+            return True
+        try:
+            if orig_getattribute(vehicle, 'id') in _MP_VEHICLE_BRIDGES:
+                return True
+        except Exception:
+            pass
         try:
             orig_getattribute(vehicle, '_mpFakeServer')
             return True
@@ -1382,6 +1414,13 @@ def _install_vehicle_patch():
 
     def _vehicle_getattribute(self, name):
         if name in ('base', 'cell'):
+            try:
+                bridge = _MP_VEHICLE_BRIDGES.get(
+                    orig_getattribute(self, 'id'))
+            except Exception:
+                bridge = None
+            if bridge is not None:
+                return bridge
             try:
                 return orig_getattribute(self, '_mpFakeServer')
             except AttributeError:
