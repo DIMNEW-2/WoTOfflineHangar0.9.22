@@ -380,6 +380,35 @@ for _i in range(40):
 check(sp.speed == 0.0 and sp.yaw > 0.9,
       'sim pivot-turns right and coasts to a stop')
 
+# remote aim easing: sampled gun angles are chased at a
+# traverse-limited rate instead of stepping verbatim
+class _FakeMatrix(object):
+
+    def __init__(self):
+        self.ypr = None
+
+    def setRotateYPR(self, ypr):
+        self.ypr = ypr
+
+
+_ap = object.__new__(BTL._VehiclePose)
+_ap.aim_yaw = _ap.aim_pitch = 0.0
+_ap.aim_yaw_target = _ap.aim_pitch_target = 0.0
+_ap._aim_yaw_written = _ap._aim_pitch_written = None
+_ap.turret_traverse = 0.5
+_ap.gun_traverse = 0.5
+_ap.aim = _ns(turretMatrix=_FakeMatrix(), gunMatrix=_FakeMatrix())
+_ap.set_aim_target(0.4, 0.1)
+_ap.advance_aim(0.05)
+check(0.0 < _ap.aim_yaw < 0.4, 'remote aim eases toward target')
+for _i in range(40):
+    _ap.advance_aim(0.05)
+check(abs(_ap.aim_yaw - 0.4) < 1e-9 and
+      abs(_ap.aim_pitch - 0.1) < 1e-9,
+      'remote aim reaches target')
+check(_ap.aim.turretMatrix.ypr == (_ap.aim_yaw, 0.0, 0.0),
+      'remote aim writes eased turret matrix')
+
 # client sampler
 bc.active = True
 bc._gun_limits = (-0.1, 0.2)

@@ -156,6 +156,8 @@ class _VehiclePose(object):
         self.speed_fwd = 12.0
         self.speed_back = 4.0
         self.traverse = 0.6
+        self.turret_traverse = 0.7
+        self.gun_traverse = 0.7
         self.half_len = 3.0
         self.half_wid = 1.5
         self.gun_limits = None
@@ -187,6 +189,11 @@ class _VehiclePose(object):
         self.aim = _AimTarget()
         self._aim_yaw_written = None
         self._aim_pitch_written = None
+        self.aim_yaw = 0.0
+        self.aim_pitch = 0.0
+        self.aim_yaw_target = 0.0
+        self.aim_pitch_target = 0.0
+        self.aim_via_rotator = False
 
     def _write_matrix(self, matrix, pose=None):
         if pose is None:
@@ -217,12 +224,58 @@ class _VehiclePose(object):
     def set_aim(self, turret_yaw, gun_pitch):
         turret_yaw = float(turret_yaw)
         gun_pitch = float(gun_pitch)
+        self.aim_yaw = turret_yaw
+        self.aim_pitch = gun_pitch
+        self.aim_yaw_target = turret_yaw
+        self.aim_pitch_target = gun_pitch
         if turret_yaw != self._aim_yaw_written:
             self.aim.turretMatrix.setRotateYPR((turret_yaw, 0.0, 0.0))
             self._aim_yaw_written = turret_yaw
         if gun_pitch != self._aim_pitch_written:
             self.aim.gunMatrix.setRotateYPR((0.0, gun_pitch, 0.0))
             self._aim_pitch_written = gun_pitch
+
+    def set_aim_target(self, turret_yaw, gun_pitch):
+        self.aim_yaw_target = float(turret_yaw)
+        self.aim_pitch_target = float(gun_pitch)
+
+    def advance_aim(self, dt):
+        # Remote aim arrives as gunAnglesPacked samples at most
+        # every 100 ms; writing them verbatim steps the turret
+        # visibly (real-client test #19).  Chase the latest
+        # sample at a traverse-limited rate instead - the stream
+        # itself is already traverse-limited by the driver's
+        # rotator, so a 1.5x catch-up rate stays smooth without
+        # lagging behind.
+        dyaw = (self.aim_yaw_target - self.aim_yaw + math.pi) \
+            % (2.0 * math.pi) - math.pi
+        dpitch = self.aim_pitch_target - self.aim_pitch
+        if dyaw == 0.0 and dpitch == 0.0:
+            return
+        if abs(dyaw) > 1.0 or abs(dpitch) > 1.0:
+            self.set_aim(self.aim_yaw_target, self.aim_pitch_target)
+            return
+        yaw_step = self.turret_traverse * 1.5 * dt
+        if dyaw > yaw_step:
+            dyaw = yaw_step
+        elif dyaw < -yaw_step:
+            dyaw = -yaw_step
+        pitch_step = self.gun_traverse * 1.5 * dt
+        if dpitch > pitch_step:
+            dpitch = pitch_step
+        elif dpitch < -pitch_step:
+            dpitch = -pitch_step
+        self.aim_yaw = (self.aim_yaw + dyaw + math.pi) \
+            % (2.0 * math.pi) - math.pi
+        self.aim_pitch += dpitch
+        if self.aim_yaw != self._aim_yaw_written:
+            self.aim.turretMatrix.setRotateYPR(
+                (self.aim_yaw, 0.0, 0.0))
+            self._aim_yaw_written = self.aim_yaw
+        if self.aim_pitch != self._aim_pitch_written:
+            self.aim.gunMatrix.setRotateYPR(
+                (0.0, self.aim_pitch, 0.0))
+            self._aim_pitch_written = self.aim_pitch
 
 
 def _fill_pose_params(pose, descr):
@@ -237,6 +290,16 @@ def _fill_pose_params(pose, descr):
         pose.traverse = max(0.05, float(descr.chassis.rotationSpeed))
     except Exception:
         pass
+    try:
+        pose.turret_traverse = max(
+            0.05, float(descr.turret.rotationSpeed))
+    except Exception:
+        pass
+    try:
+        pose.gun_traverse = max(
+            0.05, float(descr.gun.rotationSpeed))
+    except Exception:
+        pose.gun_traverse = pose.turret_traverse
     try:
         bbox = descr.chassis.hitTester.bbox
         pose.half_len = min(5.0, max(
@@ -712,7 +775,7 @@ class _BattleClient(object):
                 turret_yaw, gun_pitch = \
                     gun_rotation_shared.decodeGunAngles(
                         packed, pose.gun_limits)
-                pose.set_aim(turret_yaw, gun_pitch)
+                pose.set_aim_target(turret_yaw, gun_pitch)
             except Exception:
                 pass
         pos = msg.get('p')
@@ -829,7 +892,13 @@ class _BattleClient(object):
             'arenaExtraData': {},
             'weatherPresetID': 0,
             'denunciationsLeft': 10,
-            'clientCtx': '',
+            # A 4-byte no-op cache blob (one unknown record header,
+            # zero length).  An empty string takes the broken
+            # stock branch in BattleClientCache.load() that
+            # iterates the records dict keys calling .clear() on
+            # ints - harmless on the first battle (no records
+            # yet), fatal on the second (real-client test #19).
+            'clientCtx': '\xff\xff\x00\x00',
             'tkillIsSuspected': False,
             'team': self._my_team,
             'playerVehicleID': 0,
@@ -1422,6 +1491,8 @@ class _BattleClient(object):
             move, rotate = pose.input if can_drive else (0, 0)
             self._integrate_pose(pose, move, rotate, dt)
             pose.publish(dt)
+            if vid != my_vid:
+                pose.advance_aim(dt)
         own_pose = self._poses.get(my_vid)
         if own_pose is not None and own_pose.attached \
                 and avatar is not None:
@@ -1537,7 +1608,7 @@ class _BattleClient(object):
         if getattr(appearance, 'compoundModel', None) is None:
             return
         try:
-            self._apply_presentation(vehicle, appearance, pose)
+            self._apply_presentation(vid, vehicle, appearance, pose)
         except Exception:
             pose.attach_fails += 1
             _log('pose attach failed vid=%s (attempt %s):'
@@ -1575,14 +1646,14 @@ class _BattleClient(object):
         if appearance is None:
             return
         try:
-            self._apply_presentation(vehicle, appearance, pose)
+            self._apply_presentation(vid, vehicle, appearance, pose)
             if vid == int(getattr(self.state, 'my_vid', 0) or 0):
                 self._bind_own_matrices(pose)
         except Exception:
             _log('pose rebind failed vid=%s:' % (vid,))
             traceback.print_exc()
 
-    def _apply_presentation(self, vehicle, appearance, pose):
+    def _apply_presentation(self, vid, vehicle, appearance, pose):
         model = getattr(appearance, 'compoundModel', None)
         if model is None:
             model = getattr(vehicle, 'model', None)
@@ -1606,7 +1677,23 @@ class _BattleClient(object):
                 pass
         setup = getattr(appearance, 'setupGunMatrixTargets', None)
         if callable(setup):
-            setup(pose.aim)
+            target = pose.aim
+            pose.aim_via_rotator = False
+            if vid == int(getattr(self.state, 'my_vid', 0) or 0):
+                # Stock binds the player vehicle's gun targets to
+                # the gun rotator itself (Vehicle.startVisual):
+                # its _MatrixAnimators keyframe between the 10 Hz
+                # rotator ticks, which is what makes the retail
+                # turret glide.  Writing rotator angles into a
+                # plain matrix steps visibly instead
+                # (real-client test #19).
+                avatar = self._avatar
+                rotator = getattr(avatar, 'gunRotator', None) \
+                    if avatar is not None else None
+                if rotator is not None:
+                    target = rotator
+                    pose.aim_via_rotator = True
+            setup(target)
         pose._bound_provider = pose.provider
 
     def _bind_own_matrices(self, pose):
@@ -1698,10 +1785,11 @@ class _BattleClient(object):
                 rotator.start()
         except Exception:
             pass
-        try:
-            pose.set_aim(rotator.turretYaw, rotator.gunPitch)
-        except Exception:
-            pass
+        if not pose.aim_via_rotator:
+            try:
+                pose.set_aim(rotator.turretYaw, rotator.gunPitch)
+            except Exception:
+                pass
         # Server echo: VehicleGunRotator.__syncWithServerTurretYaw
         # snaps the predicted yaw back to vehicle.
         # getServerGunAngles() (decoded gunAnglesPacked) whenever
@@ -2433,6 +2521,14 @@ def _install_account_patch():
     from Account import PlayerAccount
     if getattr(PlayerAccount, '_mpBattlePatched', False):
         return
+    # Battle teardown code (StrategicCamera.disable via
+    # Avatar.__destroyGUI) reads BigWorld.player().positionControl
+    # after the hangar Account has been re-promoted; the Account
+    # class has no such attribute and the AttributeError aborted
+    # __destroyGUI mid-flight, leaving the battle session
+    # half-stopped for the next battle (real-client test #19).
+    if not hasattr(PlayerAccount, 'positionControl'):
+        PlayerAccount.positionControl = None
     orig_become_player = PlayerAccount.onBecomePlayer
 
     def _on_become_player(self):
