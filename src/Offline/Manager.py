@@ -2503,6 +2503,12 @@ def init_offline():
                     from Offline import NewYearServer as _NYS_init
                     _NYS_init.on_account_ready(p)
                     print '[OFFLINE] NewYearServer initialized (Holiday Ops 2018 offline event is IN_PROGRESS)'
+                    try:
+                        from Offline import MPChat as _MP_init
+                        _MP_init.on_account_ready(p)
+                    except Exception as _mpe:
+                        print '[OFFLINE] MPChat init failed: %s' % _mpe
+                        traceback.print_exc()
                 except Exception as _nye:
                     print '[OFFLINE] NewYearServer init failed: %s' % _nye
                     traceback.print_exc()

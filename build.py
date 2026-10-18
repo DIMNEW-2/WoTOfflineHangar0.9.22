@@ -24,6 +24,7 @@ FILES = [
     'Offline/__init__.py',
     'Offline/Manager.py',
     'Offline/NewYearServer.py',
+    'Offline/MPChat.py',
     'gui/Scaleform/daapi/view/login/LoginView.py',
 ]
 
@@ -63,6 +64,13 @@ def main():
                 magic = f.read(4)
             if magic != b'\x03\xf3\r\n':
                 sys.exit('ERROR: unexpected .pyc magic in %s: %r' % (dst, magic))
+        # Ship the multiplayer config template next to the mod scripts
+        # (res_mods/<version>/mp_config.txt is one of the checked paths).
+        cfg_src = os.path.join(ROOT, 'mp_config.txt')
+        if os.path.isfile(cfg_src):
+            cfg_dst = os.path.join(ROOT, 'res_mods', version, 'mp_config.txt')
+            shutil.copyfile(cfg_src, cfg_dst)
+            print('copied: ' + cfg_dst)
     print('Done. Install: copy the res_mods/<your client micropatch>/ '
           'folder (%s) into your World of Tanks folder.' % ' or '.join(TARGET_VERSIONS))
 

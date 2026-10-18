@@ -1,0 +1,23 @@
+# Local (LAN) multiplayer chat config for the offline hangar mod.
+# Put this file either next to WorldOfTanks.exe or keep it in
+# res_mods/<version>/ - both locations are checked.
+#
+# mode:
+#   auto   - look for a host on the LAN (UDP discovery); if none answers,
+#            this client becomes the host. Start the host machine first.
+#   host   - always host (other clients connect to this machine).
+#   client - only connect to the host below (or via discovery if empty).
+#   off    - disable local multiplayer completely.
+mode=auto
+#
+# host: IP of the host machine (only needed for mode=client without
+# discovery, e.g. host=192.168.1.10). Empty = use UDP discovery.
+host=
+#
+# port: TCP+UDP port used by the chat host. Allow it in the firewall
+# on the host machine (or allow WorldOfTanks.exe).
+port=15777
+#
+# nickname: your chat name. Empty = account name ("Commander");
+# duplicates on the host get _2, _3, ... suffixes automatically.
+nickname=

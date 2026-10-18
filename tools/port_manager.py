@@ -539,5 +539,23 @@ rep("""        def _safe_getFittingSlotsData(vehicle, slotsRange, VoClass=None, 
             return devices""",
 '18-fitting-slots-else')
 
+# -------------------------------------------- local multiplayer hook
+# Start the LAN chat (Offline.MPChat) right after the New Year server,
+# still inside fake_connect (before showGUI), so its ClientChat transport
+# patch is in place before the messenger connects in the lobby.
+rep("""                    from Offline import NewYearServer as _NYS_init
+                    _NYS_init.on_account_ready(p)
+                    print '[OFFLINE] NewYearServer initialized (Holiday Ops 2018 offline event is IN_PROGRESS)'""",
+"""                    from Offline import NewYearServer as _NYS_init
+                    _NYS_init.on_account_ready(p)
+                    print '[OFFLINE] NewYearServer initialized (Holiday Ops 2018 offline event is IN_PROGRESS)'
+                    try:
+                        from Offline import MPChat as _MP_init
+                        _MP_init.on_account_ready(p)
+                    except Exception as _mpe:
+                        print '[OFFLINE] MPChat init failed: %s' % _mpe
+                        traceback.print_exc()""",
+'19-mpchat-init')
+
 open(path, 'w').write(src)
 print('ALL PORT EDITS APPLIED')
