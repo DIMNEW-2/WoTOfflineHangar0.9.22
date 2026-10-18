@@ -292,6 +292,31 @@ check(_raised, 'bridge does not fabricate private attributes')
 bridge.vehicle_shoot()
 check(bc._shoot_logged is True, 'vehicle_shoot captured')
 
+# bindToVehicle: engine attachment emulation (onVehicleChanged +
+# consistent matrices target + view points), as the server would do.
+_bind_calls = []
+
+
+class _FakeConsistent(object):
+
+    def _ConsistentMatrices__setTarget(self, matrix, as_static):
+        _bind_calls.append(('target', matrix, as_static))
+
+
+_bc_avatar = _ns(
+    onVehicleChanged=lambda: _bind_calls.append(('changed',)),
+    consistentMatrices=_FakeConsistent(),
+    guiSessionProvider=_ns(shared=_ns(viewPoints=_ns(
+        updateAttachedVehicle=lambda vid: _bind_calls.append(
+            ('viewpoints', vid))))))
+bc._avatar = _bc_avatar
+_bw_entities[777] = _ns(matrix='MATRIX')
+bridge.bindToVehicle(777)
+check(_bind_calls == [('changed',), ('target', 'MATRIX', False),
+                      ('viewpoints', 777)],
+      'bindToVehicle emulates engine vehicle attachment')
+bc._avatar = None
+
 # client input application
 _filter_calls = []
 _notifier_calls = []

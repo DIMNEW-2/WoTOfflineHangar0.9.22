@@ -402,6 +402,15 @@ class _FakeServer(object):
     def switchObserverFPV(self, enabled):
         return None
 
+    def bindToVehicle(self, vehicle_id):
+        self._bc._on_bind_to_vehicle(int(vehicle_id))
+
+    def moveTo(self, position):
+        return None
+
+    def switchViewPointOrBindToVehicle(self, is_viewpoint, veh_or_point_id):
+        return None
+
     def sendStateToOwnClient(self):
         return None
 
@@ -872,6 +881,31 @@ class _BattleClient(object):
         avatar.updateArena(C.ARENA_UPDATE.VEHICLE_LIST,
                            _pack_vehicle_list(rows))
         _log('arena vehicle list published (%s vehicles)' % (len(rows),))
+        BigWorld.callback(1.0, lambda: self._diag_tick(0))
+
+    def _diag_tick(self, n):
+        if not self.active or self._tearing_down:
+            return
+        import BigWorld
+        avatar = self._avatar
+        progress = None
+        own_started = None
+        try:
+            progress = getattr(avatar, '_PlayerAvatar__initProgress', None)
+            own_id = self._vehicles.get(
+                int(getattr(self.state, 'my_vid', 0) or 0))
+            own = BigWorld.entity(own_id) if own_id else None
+            own_started = getattr(own, 'isStarted', None)
+            _log('diag tick %s: initProgress=%s gunRotator=%s '
+                 'ownVehicleStarted=%s avatarVehicle=%s'
+                 % (n, progress,
+                    getattr(avatar, 'gunRotator', None) is not None,
+                    own_started, getattr(avatar, 'vehicle', None)))
+        except Exception:
+            _log('diag tick %s failed:' % (n,))
+            traceback.print_exc()
+        if n < 4:
+            BigWorld.callback(1.0, lambda: self._diag_tick(n + 1))
 
     def _publish_period(self, period, length):
         if self._avatar is None:
@@ -910,6 +944,48 @@ class _BattleClient(object):
         if not self._ready_sent:
             self._ready_sent = True
             self._send(cmd='ready')
+
+    def _on_bind_to_vehicle(self, vehicle_id):
+        # AvatarPositionControl.bindToVehicle asks the server to
+        # attach the Avatar to its Vehicle; on a real server the
+        # engine then sets avatar.vehicle and fires onVehicleChanged,
+        # which links the consistent-matrices target and the battle
+        # GUI view points to the vehicle. None of that happens for a
+        # client-only entity, so reproduce the Python-side results
+        # here, synchronously - the input handler enables the arcade
+        # camera right after this mailbox call returns.
+        _log('bindToVehicle(%s) - emulating engine attachment'
+             % (vehicle_id,))
+        avatar = self._avatar
+        if avatar is None or not vehicle_id:
+            return
+        import BigWorld
+        try:
+            avatar.onVehicleChanged()
+        except Exception:
+            _log('onVehicleChanged emulation failed:')
+            traceback.print_exc()
+        vehicle = None
+        try:
+            vehicle = BigWorld.entity(vehicle_id)
+        except Exception:
+            vehicle = None
+        if vehicle is None:
+            _log('bindToVehicle: vehicle entity %s not found'
+                 % (vehicle_id,))
+            return
+        try:
+            avatar.consistentMatrices._ConsistentMatrices__setTarget(
+                vehicle.matrix, False)
+        except Exception:
+            _log('consistentMatrices target link failed:')
+            traceback.print_exc()
+        try:
+            avatar.guiSessionProvider.shared.viewPoints.\
+                updateAttachedVehicle(vehicle_id)
+        except Exception:
+            _log('viewPoints.updateAttachedVehicle failed:')
+            traceback.print_exc()
 
     def _on_move_flags(self, flags):
         self._cur_input = _dirs_from_flags(flags)
@@ -1155,18 +1231,52 @@ def _install_avatar_patch():
             # In case the stock __init__ (or the engine) dropped any
             # of the seeded attributes, seed the missing ones again.
             _seed_pending_props(self, pending[0])
+            # AvatarObserver.onEnterWorld (fired right after __init__
+            # inside createEntity) needs filter.syncVector3 & co;
+            # the engine-default filter of a client-only entity does
+            # not have them, and stock onBecomePlayer only installs
+            # BigWorld.AvatarFilter() later. Install it now,
+            # unconditionally (real-client test 2026-10-18 #3:
+            # "filter does not have method syncVector3").
             try:
-                if getattr(self, 'filter', None) is None:
-                    import BigWorld
-                    self.filter = BigWorld.AvatarFilter()
-                    try:
-                        self.filter.enableLagDetection(True)
-                    except Exception:
-                        pass
+                import BigWorld
+                self.filter = BigWorld.AvatarFilter()
+                try:
+                    self.filter.enableLagDetection(True)
+                except Exception:
+                    pass
             except Exception:
                 pass
 
     PlayerAvatar.__init__ = _avatar_init
+
+    orig_become_player = getattr(PlayerAvatar, 'onBecomePlayer', None)
+
+    def _avatar_become_player(self):
+        # Stock onBecomePlayer does ``self.filter =
+        # BigWorld.AvatarFilter()``, which would replace the filter
+        # AvatarObserver already cached bound methods from in
+        # onEnterWorld. Make the factory hand back the same instance
+        # for our battle Avatar.
+        try:
+            is_battle = orig_getattribute(self, '_mpBattle')
+        except AttributeError:
+            is_battle = False
+        if not is_battle:
+            return orig_become_player(self)
+        import BigWorld
+        existing = getattr(self, 'filter', None)
+        orig_factory = getattr(BigWorld, 'AvatarFilter', None)
+        if existing is None or not callable(orig_factory):
+            return orig_become_player(self)
+        BigWorld.AvatarFilter = lambda: existing
+        try:
+            return orig_become_player(self)
+        finally:
+            BigWorld.AvatarFilter = orig_factory
+
+    if orig_become_player is not None:
+        PlayerAvatar.onBecomePlayer = _avatar_become_player
     PlayerAvatar._mpBattlePatched = True
 
 
@@ -1256,6 +1366,60 @@ def _install_account_patch():
     PlayerAccount._mpBattlePatched = True
 
 
+def _diag_wrap(cls, attr_name, label):
+    orig = getattr(cls, attr_name, None)
+    if orig is None or getattr(orig, '_mpBattleDiag', False):
+        return
+
+    def _wrapped(self, *args, **kwargs):
+        _log('>> %s' % (label,))
+        try:
+            return orig(self, *args, **kwargs)
+        finally:
+            _log('<< %s' % (label,))
+
+    _wrapped._mpBattleDiag = True
+    try:
+        setattr(cls, attr_name, _wrapped)
+    except Exception:
+        pass
+
+
+def _install_diag_patches():
+    """Breadcrumb-log the stock battle-init sequence.
+
+    The real client died natively somewhere inside the init-completed
+    cascade (startGUI -> input handler -> vehicle visuals) with no
+    Python traceback; these enter/exit logs pinpoint the fatal call.
+    They only ever fire in battle, once per battle.
+    """
+    try:
+        from Avatar import PlayerAvatar
+        _diag_wrap(PlayerAvatar, '_PlayerAvatar__onInitStepCompleted',
+                   'Avatar.__onInitStepCompleted')
+        _diag_wrap(PlayerAvatar, '_PlayerAvatar__startGUI',
+                   'Avatar.__startGUI')
+    except Exception:
+        pass
+    try:
+        from Vehicle import Vehicle
+        _diag_wrap(Vehicle, 'startVisual', 'Vehicle.startVisual')
+    except Exception:
+        pass
+    try:
+        from AvatarInputHandler import AvatarInputHandler
+        _diag_wrap(AvatarInputHandler, 'start',
+                   'AvatarInputHandler.start')
+    except Exception:
+        pass
+    try:
+        from AvatarInputHandler.control_modes import ArcadeControlMode
+        _diag_wrap(ArcadeControlMode, 'enable',
+                   'ArcadeControlMode.enable')
+    except Exception:
+        pass
+
+
 def install(state):
     """Create the battle client and install the entity patches.
 
@@ -1270,5 +1434,6 @@ def install(state):
     _install_avatar_patch()
     _install_vehicle_patch()
     _install_account_patch()
+    _install_diag_patches()
     _log('battle client patches installed')
     return client
