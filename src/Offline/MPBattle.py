@@ -917,15 +917,22 @@ class _BattleClient(object):
                 world_draw = BigWorld.worldDrawEnabled()
             except Exception:
                 world_draw = '?'
+            own_pos = None
+            try:
+                if own is not None:
+                    p = own.position
+                    own_pos = '(%.1f,%.1f)' % (p[0], p[2])
+            except Exception:
+                own_pos = '?'
             _log('diag tick %s: initProgress=%s gunRotator=%s '
                  'ownVehicleStarted=%s avatarVehicle=%s spaceLoad=%s '
-                 'worldDraw=%s period=%s'
+                 'worldDraw=%s period=%s pos=%s input=%s'
                  % (n, progress,
                     getattr(avatar, 'gunRotator', None) is not None,
                     own_started, getattr(avatar, 'vehicle', None),
                     space_load, world_draw,
                     getattr(getattr(avatar, 'arena', None),
-                            'period', None)))
+                            'period', None), own_pos, self._cur_input))
         except Exception:
             _log('diag tick %s failed:' % (n,))
             traceback.print_exc()
@@ -1025,7 +1032,14 @@ class _BattleClient(object):
             traceback.print_exc()
 
     def _on_move_flags(self, flags):
-        self._cur_input = _dirs_from_flags(flags)
+        dirs = _dirs_from_flags(flags)
+        if dirs != self._cur_input:
+            # Proves keys reach the stock Avatar movement path
+            # (which calls filter.notifyInputKeysDown just before
+            # base.vehicle_moveWith lands here).
+            _log('move flags %s -> (m=%s, r=%s)'
+                 % (flags, dirs[0], dirs[1]))
+        self._cur_input = dirs
 
     def _on_autoaim(self, vehicle_id):
         # Without a server the gun rotator waits for server-driven
@@ -1703,6 +1717,25 @@ def _install_account_patch():
 
         PlayerAccount.vehicle_onLeaveWorld = (
             _account_vehicle_on_leave_world)
+    # More of the same, surfaced by test #12 teardown (harmless but
+    # they abort Avatar.__destroyGUI even earlier).
+    if not hasattr(PlayerAccount, 'playerVehicleID'):
+        PlayerAccount.playerVehicleID = 0
+    if not hasattr(PlayerAccount, 'onGunShotChanged'):
+        class _NoopEvent(object):
+            def __iadd__(self, handler):
+                return self
+
+            def __isub__(self, handler):
+                return self
+
+            def __call__(self, *args, **kwargs):
+                return None
+
+            def clear(self):
+                pass
+
+        PlayerAccount.onGunShotChanged = _NoopEvent()
 
     PlayerAccount._mpBattlePatched = True
 
@@ -1745,6 +1778,24 @@ def _ensure_battle_page_patch():
         traceback.print_exc()
 
 
+def _disable_gui_background():
+    # BattleLoading._populate re-enables the GUI background right
+    # AFTER addArenaCtrl replays arenaLoadCompleted into it (our
+    # space-load listener finished before the page populated), so
+    # the map backdrop stays over the 3D scene forever: the view's
+    # own wg_enableGUIBackground(False, True) already fired into
+    # the void (real-client test 2026-10-18 #12). Repeat the exact
+    # call once the battle page is actually shown.
+    try:
+        import BigWorld
+        BigWorld.wg_enableGUIBackground(False, True)
+        _log('GUI background disabled (post showBattlePage)')
+        _diag_flush()
+    except Exception:
+        _log('wg_enableGUIBackground failed:')
+        traceback.print_exc()
+
+
 def _poll_pending_battle_page(orig_show_page):
     pending = _PENDING_BATTLE_PAGE[0]
     if pending is None:
@@ -1766,6 +1817,7 @@ def _poll_pending_battle_page(orig_show_page):
         try:
             orig_show_page(loader)
             _BATTLE_PAGE_DONE[0] = True
+            _disable_gui_background()
         except Exception:
             _log('deferred showBattlePage failed:')
             traceback.print_exc()
@@ -1839,6 +1891,7 @@ def _install_app_loader_patch():
         if _BATTLE_PAGE_POPULATED[0] or _BATTLE_PAGE_DONE[0]:
             result = orig_show_page(self)
             _BATTLE_PAGE_DONE[0] = True
+            _disable_gui_background()
             return result
         # Exiting BattleLoadingState in this same call stack loses
         # the battle page: BattleLoadingState.showGUI only calls
@@ -1958,38 +2011,9 @@ def _install_diag_patches():
                      % (getattr(self, 'id', None),
                         getattr(self, 'isPlayerVehicle', None)))
                 _diag_flush()
-                # Trace every Python call + every line of the
-                # startVisual frame itself, flushing each entry, so
-                # the last log line before a native death names the
-                # exact call. Only active for this one method.
-                import sys
-                _budget = [4000]
-
-                def _tracer(frame, event, arg):
-                    if _budget[0] <= 0:
-                        return None
-                    if event == 'call':
-                        _budget[0] -= 1
-                        _log('CALL %s (%s:%s)'
-                             % (frame.f_code.co_name,
-                                frame.f_code.co_filename.replace(
-                                    '\\', '/').rsplit('/', 1)[-1],
-                                frame.f_lineno))
-                        _diag_flush()
-                        return _tracer
-                    if event == 'line' and \
-                            frame.f_code.co_name == 'startVisual':
-                        _budget[0] -= 1
-                        _log('LINE startVisual:%s' % (frame.f_lineno,))
-                        _diag_flush()
-                    return _tracer
-
-                _prev_trace = sys.gettrace()
-                sys.settrace(_tracer)
                 try:
                     return _orig(self)
                 finally:
-                    sys.settrace(_prev_trace)
                     _log('<< Vehicle.startVisual id=%s'
                          % (getattr(self, 'id', None),))
                     _diag_flush()
