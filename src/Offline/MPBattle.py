@@ -1505,7 +1505,10 @@ def _install_account_patch():
 
 def _diag_wrap(cls, attr_name, label):
     orig = getattr(cls, attr_name, None)
-    if orig is None or getattr(orig, '_mpBattleDiag', False):
+    if orig is None:
+        _log('diag wrap FAILED (missing attr): %s' % (label,))
+        return
+    if getattr(orig, '_mpBattleDiag', False):
         return
 
     def _wrapped(self, *args, **kwargs):
@@ -1520,8 +1523,9 @@ def _diag_wrap(cls, attr_name, label):
     _wrapped._mpBattleDiag = True
     try:
         setattr(cls, attr_name, _wrapped)
+        _log('diag wrap ok: %s' % (label,))
     except Exception:
-        pass
+        _log('diag wrap FAILED (setattr): %s' % (label,))
 
 
 def _diag_flush():
@@ -1567,11 +1571,41 @@ def _install_diag_patches():
                      % (getattr(self, 'id', None),
                         getattr(self, 'isPlayerVehicle', None)))
                 _diag_flush()
+                # Trace every Python call + every line of the
+                # startVisual frame itself, flushing each entry, so
+                # the last log line before a native death names the
+                # exact call. Only active for this one method.
+                import sys
+                _budget = [4000]
+
+                def _tracer(frame, event, arg):
+                    if _budget[0] <= 0:
+                        return None
+                    if event == 'call':
+                        _budget[0] -= 1
+                        _log('CALL %s (%s:%s)'
+                             % (frame.f_code.co_name,
+                                frame.f_code.co_filename.replace(
+                                    '\\', '/').rsplit('/', 1)[-1],
+                                frame.f_lineno))
+                        _diag_flush()
+                        return _tracer
+                    if event == 'line' and \
+                            frame.f_code.co_name == 'startVisual':
+                        _budget[0] -= 1
+                        _log('LINE startVisual:%s' % (frame.f_lineno,))
+                        _diag_flush()
+                    return _tracer
+
+                _prev_trace = sys.gettrace()
+                sys.settrace(_tracer)
                 try:
                     return _orig(self)
                 finally:
+                    sys.settrace(_prev_trace)
                     _log('<< Vehicle.startVisual id=%s'
                          % (getattr(self, 'id', None),))
+                    _diag_flush()
 
             _start_visual._mpBattleDiag = True
             Vehicle.startVisual = _start_visual
@@ -1628,6 +1662,31 @@ def _install_diag_patches():
             appearance_cache.getAppearance = _get_appearance
     except Exception:
         pass
+    # The tail of startVisual after set_damageStickers: trigger
+    # activation, then session-provider vehicle registration.
+    try:
+        import TriggersManager
+        _diag_wrap(TriggersManager.TriggersManager, 'activateTrigger',
+                   'TriggersManager.activateTrigger')
+    except Exception:
+        _log('diag wrap FAILED (import): TriggersManager')
+        traceback.print_exc()
+    try:
+        from gui.battle_control.battle_session import \
+            BattleSessionProvider
+        _diag_wrap(BattleSessionProvider, 'startVehicleVisual',
+                   'BattleSessionProvider.startVehicleVisual')
+    except Exception:
+        _log('diag wrap FAILED (import): BattleSessionProvider')
+        traceback.print_exc()
+    try:
+        from gui.battle_control.controllers.feedback_adaptor import \
+            BattleFeedbackAdaptor
+        _diag_wrap(BattleFeedbackAdaptor, 'startVehicleVisual',
+                   'FeedbackAdaptor.startVehicleVisual')
+    except Exception:
+        _log('diag wrap FAILED (import): BattleFeedbackAdaptor')
+        traceback.print_exc()
 
 
 def install(state):
