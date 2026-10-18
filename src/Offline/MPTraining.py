@@ -493,6 +493,16 @@ class _TrainingServer(object):
                     return [srv._view_rid(c, v), p, r, srv._view_rid(c, a)]
 
                 self._upd(room, C.PREBATTLE_UPDATE.PLAYER_ROSTER, arg_for)
+                # LAN convenience (requested by the user): being
+                # assigned to a team auto-readies the player, so the
+                # creator's stock "В бой!" button - which the stock
+                # validator only enables with >=1 READY player per
+                # team - works without everyone pressing «Готов»
+                # first. A player can still un-ready manually after.
+                if assigned and member.state != \
+                        C.PREBATTLE_ACCOUNT_STATE.READY:
+                    member.state = C.PREBATTLE_ACCOUNT_STATE.READY
+                    self._broadcast_player_state(room, target_vid)
                 ok = True
         self._resp(conn, msg, ok)
 
@@ -579,6 +589,16 @@ class _TrainingServer(object):
             # deduplicated).
             room.team_states[1] = C.PREBATTLE_TEAM_STATE.READY
             room.team_states[2] = C.PREBATTLE_TEAM_STATE.READY
+            # Force-ready every team-assigned player as well (the
+            # personal «Готов» flags the GUI shows and the battle
+            # roster is built from), per user request: pressing
+            # «В бой!» readies everyone distributed into teams.
+            for member in room.members.itervalues():
+                _team, _assigned = _decode_roster(member.roster)
+                if _assigned and member.state != \
+                        C.PREBATTLE_ACCOUNT_STATE.READY:
+                    member.state = C.PREBATTLE_ACCOUNT_STATE.READY
+                    self._broadcast_player_state(room, member.vid)
             self._resp(conn, msg, True)
             self._broadcast_team_states(room)
             self._schedule_battle_start(room)

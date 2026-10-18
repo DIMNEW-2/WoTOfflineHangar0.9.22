@@ -416,6 +416,35 @@ check(_raised, 'avatar mailboxes untouched outside battle')
 _veh = _Vehicle()
 _veh._mpFakeServer = bridge
 check(_veh.cell is bridge, 'vehicle cell redirects to fakeServer')
+
+# scoped filter proxy: syncGunAngles/syncStabilisedYPR are swallowed
+# only while the vehicle is in _FILTER_SCOPED (startWGPhysics /
+# set_gunAnglesPacked); everything else delegates to the real filter.
+class _FakeFilter(object):
+    speedInfo = 'speed'
+
+    def __init__(self):
+        self.synced = []
+
+    def syncGunAngles(self, yaw, pitch):
+        self.synced.append((yaw, pitch))
+
+    def syncStabilisedYPR(self, y, p, r):
+        self.synced.append((y, p, r))
+
+
+_real_filter = _FakeFilter()
+_veh.filter = _real_filter
+check(_veh.filter is _real_filter, 'filter unproxied outside scope')
+BTL._FILTER_SCOPED.append(_veh)
+check(_veh.filter.speedInfo == 'speed', 'filter proxy delegates attrs')
+_veh.filter.syncGunAngles(1.0, 2.0)
+_veh.filter.syncStabilisedYPR(1.0, 2.0, 3.0)
+check(_real_filter.synced == [], 'filter proxy swallows native syncs')
+BTL._remove_scoped(_veh)
+_veh.filter.syncGunAngles(0.5, 0.25)
+check(_real_filter.synced == [(0.5, 0.25)],
+      'real filter sync works again after scope')
 try:
     _Vehicle().cell
     _raised = False

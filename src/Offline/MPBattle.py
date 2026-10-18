@@ -1277,7 +1277,84 @@ def _install_avatar_patch():
 
     if orig_become_player is not None:
         PlayerAvatar.onBecomePlayer = _avatar_become_player
+
+    # PlayerAvatar.__onSetOwnVehicleAuxPhysicsData forwards into
+    # ownVehicle.filter.syncStabilisedYPR - same unsafe native sync
+    # as syncGunAngles. Scope the filter proxy around the notifier.
+    orig_set_aux = getattr(PlayerAvatar, 'set_ownVehicleAuxPhysicsData',
+                           None)
+    if orig_set_aux is not None:
+        def _set_aux_physics(self, prev):
+            try:
+                is_battle = orig_getattribute(self, '_mpBattle')
+            except AttributeError:
+                is_battle = False
+            if not is_battle:
+                return orig_set_aux(self, prev)
+            vehicle = None
+            try:
+                import BigWorld
+                vehicle = BigWorld.entity(
+                    orig_getattribute(self, 'playerVehicleID'))
+            except Exception:
+                vehicle = None
+            if vehicle is not None:
+                _FILTER_SCOPED.append(vehicle)
+            try:
+                return orig_set_aux(self, prev)
+            finally:
+                if vehicle is not None:
+                    _remove_scoped(vehicle)
+
+        PlayerAvatar.set_ownVehicleAuxPhysicsData = _set_aux_physics
+
     PlayerAvatar._mpBattlePatched = True
+
+
+class _VehicleFilterSyncProxy(object):
+    """Delegates a WGVehicleFilter except the retail-only sync calls.
+
+    ``syncGunAngles``/``syncStabilisedYPR`` submit samples to the
+    native interpolation filter a server-driven Vehicle has behind
+    it; on a client-only Vehicle that native filter is null and the
+    call crashes the client. Everything else delegates untouched.
+    """
+
+    def __init__(self, vehicle_filter):
+        object.__setattr__(self, '_vehicle_filter', vehicle_filter)
+
+    def __getattr__(self, name):
+        return getattr(object.__getattribute__(self, '_vehicle_filter'),
+                       name)
+
+    def __setattr__(self, name, value):
+        setattr(object.__getattribute__(self, '_vehicle_filter'),
+                name, value)
+
+    def syncGunAngles(self, yaw, pitch):
+        return None
+
+    def syncStabilisedYPR(self, yaw, pitch, roll):
+        return None
+
+
+# Vehicle entities currently inside a stock call that must see the
+# sync-swallowing filter proxy (see _install_vehicle_patch).
+_FILTER_SCOPED = []
+
+
+def _is_filter_scoped(vehicle):
+    for scoped in _FILTER_SCOPED:
+        if scoped is vehicle:
+            return True
+    return False
+
+
+def _remove_scoped(vehicle):
+    for index, scoped in enumerate(_FILTER_SCOPED):
+        if scoped is vehicle:
+            del _FILTER_SCOPED[index]
+            return
 
 
 def _install_vehicle_patch():
@@ -1286,15 +1363,59 @@ def _install_vehicle_patch():
         return
     orig_getattribute = Vehicle.__getattribute__
 
+    def _is_mp_vehicle(vehicle):
+        try:
+            orig_getattribute(vehicle, '_mpFakeServer')
+            return True
+        except AttributeError:
+            return False
+
     def _vehicle_getattribute(self, name):
         if name in ('base', 'cell'):
             try:
                 return orig_getattribute(self, '_mpFakeServer')
             except AttributeError:
                 pass
+        if name == 'filter' and _is_filter_scoped(self):
+            return _VehicleFilterSyncProxy(
+                orig_getattribute(self, 'filter'))
         return orig_getattribute(self, name)
 
     Vehicle.__getattribute__ = _vehicle_getattribute
+
+    # Vehicle.__startWGPhysics and set_gunAnglesPacked call
+    # filter.syncGunAngles(), which natively asserts/crashes on a
+    # client-only Vehicle (no retail interpolation filter behind it -
+    # real-client death inside Vehicle.startVisual, 2026-10-18 #4).
+    # Scope a filter proxy that swallows just those syncs around both
+    # entry points, for our battle vehicles only.
+    orig_start_physics = getattr(Vehicle, '_Vehicle__startWGPhysics',
+                                  None)
+    if orig_start_physics is not None:
+        def _start_wg_physics(self):
+            if not _is_mp_vehicle(self):
+                return orig_start_physics(self)
+            _FILTER_SCOPED.append(self)
+            try:
+                return orig_start_physics(self)
+            finally:
+                _remove_scoped(self)
+
+        Vehicle._Vehicle__startWGPhysics = _start_wg_physics
+
+    orig_set_gun = getattr(Vehicle, 'set_gunAnglesPacked', None)
+    if orig_set_gun is not None:
+        def _set_gun_angles_packed(self, prev):
+            if not _is_mp_vehicle(self):
+                return orig_set_gun(self, prev)
+            _FILTER_SCOPED.append(self)
+            try:
+                return orig_set_gun(self, prev)
+            finally:
+                _remove_scoped(self)
+
+        Vehicle.set_gunAnglesPacked = _set_gun_angles_packed
+
     Vehicle._mpBattlePatched = True
 
 
@@ -1403,7 +1524,21 @@ def _install_diag_patches():
         pass
     try:
         from Vehicle import Vehicle
-        _diag_wrap(Vehicle, 'startVisual', 'Vehicle.startVisual')
+        _orig_start_visual = getattr(Vehicle, 'startVisual', None)
+        if _orig_start_visual is not None and not getattr(
+                _orig_start_visual, '_mpBattleDiag', False):
+            def _start_visual(self, _orig=_orig_start_visual):
+                _log('>> Vehicle.startVisual id=%s player=%s'
+                     % (getattr(self, 'id', None),
+                        getattr(self, 'isPlayerVehicle', None)))
+                try:
+                    return _orig(self)
+                finally:
+                    _log('<< Vehicle.startVisual id=%s'
+                         % (getattr(self, 'id', None),))
+
+            _start_visual._mpBattleDiag = True
+            Vehicle.startVisual = _start_visual
     except Exception:
         pass
     try:

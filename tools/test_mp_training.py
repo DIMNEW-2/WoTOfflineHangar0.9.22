@@ -291,6 +291,13 @@ check(ps_b and ps_b[0][0] == 22, 'Bob sees own PLAYER_STATE with entityID')
 del a_in[:]
 del b_in[:]
 
+# Bob un-readies (so the assign below can prove auto-ready)
+prb(srv, bob, cmd='notReady', req=55, vehInvID=12)
+check(srv.training.rooms[1].members[bob.vid].state
+      == C.PREBATTLE_ACCOUNT_STATE.NOT_READY, 'Bob manually not ready')
+del a_in[:]
+del b_in[:]
+
 # Alice assigns Bob to team 2 assigned (roster 2)
 prb(srv, alice, cmd='assign', req=6, playerID=bob.vid, roster=2)
 check(evs(a_in, 'resp')[0]['code'] == 0, 'assign by creator ok')
@@ -298,6 +305,14 @@ pro_b = upds(b_in, C.PREBATTLE_UPDATE.PLAYER_ROSTER)
 check(pro_b and pro_b[0][0] == 22 and pro_b[0][1] == 17 and pro_b[0][2] == 2
       and pro_b[0][3] == alice.vid,
       'Bob sees own move 17->2, actor=Alice vid')
+# auto-ready: being assigned to a team readies the player (user request)
+ps_b2 = upds(b_in, C.PREBATTLE_UPDATE.PLAYER_STATE)
+check(ps_b2 and ps_b2[-1][0] == 22
+      and ps_b2[-1][2] == C.PREBATTLE_ACCOUNT_STATE.READY,
+      'assign auto-readies the player (PLAYER_STATE READY)')
+check(srv.training.rooms[1].members[bob.vid].state
+      == C.PREBATTLE_ACCOUNT_STATE.READY,
+      'server-side member state READY after assign')
 del a_in[:]
 del b_in[:]
 
