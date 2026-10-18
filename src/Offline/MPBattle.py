@@ -612,11 +612,20 @@ class _BattleClient(object):
 
         # PlayerAvatar.onEnterWorld runs synchronously inside
         # createEntity and already reads playerVehicleID (and
-        # onBecomePlayer reads the arena* fields for ClientArena), so
-        # every client-visible Avatar.def property must be present in
-        # the create props - post-creation assignment is too late
-        # (real-client failure 2026-10-18: "'PlayerAvatar' object has
-        # no attribute 'playerVehicleID'" from onEnterWorld).
+        # onBecomePlayer reads the arena* fields for ClientArena).
+        # createEntity's property dict is silently ignored for the
+        # Avatar entity, so the values are seeded by the patched
+        # PlayerAvatar.__init__ from _PENDING_AVATAR during
+        # construction (see _install_avatar_patch), then assigned
+        # once more below for anything the engine dropped.
+        try:
+            import Math
+            remote_camera = {'time': 0.0,
+                             'shotPoint': Math.Vector3(0.0, 0.0, 0.0),
+                             'zoom': 0}
+        except Exception:
+            remote_camera = {'time': 0.0, 'shotPoint': (0.0, 0.0, 0.0),
+                             'zoom': 0}
         avatar_props = {
             'name': _b(me.get('nick', u'')),
             'arenaUniqueID': int(msg.get('arenaUniqueID', 0) or 0),
@@ -625,7 +634,7 @@ class _BattleClient(object):
             'arenaGuiType': C.ARENA_GUI_TYPE.TRAINING,
             'arenaExtraData': {},
             'weatherPresetID': 0,
-            'denunciationsLeft': 0,
+            'denunciationsLeft': 10,
             'clientCtx': '',
             'tkillIsSuspected': False,
             'team': self._my_team,
@@ -634,28 +643,31 @@ class _BattleClient(object):
             'isGunLocked': False,
             'ownVehicleGear': 0,
             'ownVehicleAuxPhysicsData': 0,
+            'remoteCamera': remote_camera,
             'isObserverFPV': False,
             'observerFPVControlMode': 0,
             'numOfObservers': 0}
+        _PENDING_AVATAR.append((avatar_props, self._bridge))
         try:
             self._avatar_id = BigWorld.createEntity(
                 'Avatar', self._space_id, 0, (spawn[0], 0.0, spawn[1]),
-                (0.0, 0.0, yaw), avatar_props)
-        except Exception:
-            # Engine rejected some property: retry with only the
-            # fields read during creation/promotion.
-            _log('Avatar createEntity with full props failed, '
-                 'retrying minimal:')
-            traceback.print_exc()
-            minimal = dict((key, avatar_props[key]) for key in (
-                'name', 'arenaUniqueID', 'arenaTypeID', 'arenaBonusType',
-                'arenaGuiType', 'arenaExtraData', 'weatherPresetID',
-                'team', 'playerVehicleID'))
-            self._avatar_id = BigWorld.createEntity(
-                'Avatar', self._space_id, 0, (spawn[0], 0.0, spawn[1]),
-                (0.0, 0.0, yaw), minimal)
+                (0.0, 0.0, yaw), {})
+        finally:
+            del _PENDING_AVATAR[:]
         avatar = BigWorld.entities[self._avatar_id]
         self._avatar = avatar
+        for _key in ('name', 'arenaUniqueID', 'arenaTypeID',
+                     'arenaBonusType', 'arenaGuiType', 'arenaExtraData',
+                     'weatherPresetID', 'denunciationsLeft', 'clientCtx',
+                     'tkillIsSuspected', 'team', 'playerVehicleID',
+                     'isObserverBothTeams', 'isGunLocked',
+                     'ownVehicleGear', 'ownVehicleAuxPhysicsData',
+                     'isObserverFPV', 'observerFPVControlMode',
+                     'numOfObservers'):
+            try:
+                setattr(avatar, _key, avatar_props[_key])
+            except Exception:
+                pass
         avatar.fakeServer = self._bridge
         avatar._mpBattle = True
         # helpers.statistics polls BigWorld.player().prebattle every
@@ -1089,6 +1101,18 @@ class _BattleClient(object):
 # Patches
 # ---------------------------------------------------------------------------
 
+# One-item mailbox for the Avatar __init__ patch: while _enter creates
+# the client-only Avatar, this holds (property dict, fake-server
+# bridge) so the patched PlayerAvatar.__init__ can seed the typed
+# entity properties during construction. BigWorld.createEntity's own
+# property dict is silently ignored for the Avatar (real-client test
+# 2026-10-18 #2: playerVehicleID/arenaBonusType still missing despite
+# being passed), but attributes set during __init__ stick - and
+# onEnterWorld, fired synchronously inside createEntity right after
+# __init__, already reads playerVehicleID.
+_PENDING_AVATAR = []
+
+
 def _install_avatar_patch():
     from Avatar import PlayerAvatar
     if getattr(PlayerAvatar, '_mpBattlePatched', False):
@@ -1105,6 +1129,44 @@ def _install_avatar_patch():
         return orig_getattribute(self, name)
 
     PlayerAvatar.__getattribute__ = _avatar_getattribute
+
+    orig_init = PlayerAvatar.__init__
+
+    def _seed_pending_props(self, props):
+        for _key, _value in props.items():
+            try:
+                if not hasattr(self, _key):
+                    setattr(self, _key, _value)
+            except Exception:
+                pass
+
+    def _avatar_init(self):
+        pending = _PENDING_AVATAR[0] if _PENDING_AVATAR else None
+        if pending is not None:
+            props, bridge = pending
+            _seed_pending_props(self, props)
+            try:
+                self.fakeServer = bridge
+                self._mpBattle = True
+            except Exception:
+                pass
+        orig_init(self)
+        if pending is not None:
+            # In case the stock __init__ (or the engine) dropped any
+            # of the seeded attributes, seed the missing ones again.
+            _seed_pending_props(self, pending[0])
+            try:
+                if getattr(self, 'filter', None) is None:
+                    import BigWorld
+                    self.filter = BigWorld.AvatarFilter()
+                    try:
+                        self.filter.enableLagDetection(True)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+    PlayerAvatar.__init__ = _avatar_init
     PlayerAvatar._mpBattlePatched = True
 
 

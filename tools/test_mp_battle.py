@@ -423,7 +423,9 @@ def _bw_create_space():
 
 
 def _bw_create_entity(cls_name, space_id, veh_id, pos, dir_, props):
-    ent = _FakeAvatarEnt()
+    # Route the Avatar through the patched PlayerAvatar class so the
+    # __init__ property seeding is exercised like on the real client.
+    ent = _PlayerAvatar() if cls_name == 'Avatar' else _FakeAvatarEnt()
     eid = 9000 + len(_bw_created)
     _bw_entities[eid] = ent
     _bw_created.append((cls_name, pos, dict(props)))
@@ -494,12 +496,19 @@ client3._enter({'arenaTypeID': 70, 'arenaUniqueID': 123, 'roomID': 1,
                              'spawn': 0}]})
 check(len(_bw_created) == 1 and _bw_created[0][0] == 'Avatar',
       'enter creates one Avatar entity')
-_props = _bw_created[0][2]
-check(_props.get('playerVehicleID') == 0 and _props.get('team') == 1
-      and _props.get('arenaTypeID') == 70
-      and _props.get('arenaUniqueID') == 123
-      and _props.get('name') == 'Me',
-      'avatar def props seeded in createEntity (playerVehicleID=0)')
+check(_bw_created[0][2] == {},
+      'createEntity property dict left empty (engine ignores it)')
+check(client3._avatar.playerVehicleID == 0
+      and client3._avatar.team == 1
+      and client3._avatar.arenaTypeID == 70
+      and client3._avatar.arenaUniqueID == 123
+      and client3._avatar.arenaBonusType == 2
+      and client3._avatar.name == 'Me',
+      'avatar def props seeded via patched __init__ (playerVehicleID=0)')
+check(client3._avatar.fakeServer is client3._bridge
+      and client3._avatar.base is client3._bridge,
+      'avatar bridge wired during construction')
+check(not BTL._PENDING_AVATAR, 'pending avatar props cleared after enter')
 check(_bw_created[0][1] == (30.0, 0.0, 40.0),
       'spawn point falls back to geometry cache points')
 check(client3._avatar.prebattle is None,
