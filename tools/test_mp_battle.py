@@ -628,6 +628,16 @@ _acc = _PlayerAccount()
 _acc.onBecomePlayer()
 check(_acc.became_player is True and not _bw_clear_calls,
       'account onBecomePlayer runs without clearAllSpaces')
+check(_acc.arena is None and _acc.positionControl is None
+      and _acc.inputHandler is None and _acc.observedVehicleID == 0,
+      'account teardown sentinels served')
+try:
+    _probe = _acc.consistentMatrices.onVehicleMatrixBindingChanged
+    _probe -= _acc.onBecomePlayer
+    _sentinel_ok = True
+except Exception:
+    _sentinel_ok = False
+check(_sentinel_ok, 'account consistentMatrices dummy event works')
 BW.clearAllSpaces()
 check(_bw_clear_calls == [True], 'clearAllSpaces restored after wrapper')
 

@@ -1882,8 +1882,6 @@ class _BattleClient(object):
         self._tearing_down = True
         import BigWorld
         _log('tearing down battle, returning to hangar')
-        self._poses = {}
-        self._entity_vid = {}
         # Promote the hangar Account FIRST, while the Avatar entity is
         # still alive: the engine demotes the Avatar, whose stock
         # onBecomeNonPlayer stops the battle GUI session, destroys the
@@ -1916,6 +1914,15 @@ class _BattleClient(object):
                 pass
         self._avatar = None
         self._avatar_id = 0
+        # Retire poses only after every entity is destroyed: the
+        # stock appearances/animators hold our matrix providers,
+        # and dropping the last Python references while native
+        # teardown may still evaluate them is a crash hazard
+        # (client process died returning from battle #1,
+        # real-client test #20).
+        _RETIRED_POSES[:] = list(self._poses.itervalues())
+        self._poses = {}
+        self._entity_vid = {}
         # Release only OUR battle space (the Account lives in its own).
         try:
             BigWorld.cameraSpaceID(0)
@@ -2293,6 +2300,12 @@ _AVATAR_BOUND_VEHICLE = [None]
 # without depending on attribute storage on engine entities.
 _MP_VEHICLE_BRIDGES = {}
 
+# Poses of the most recently torn-down battle, kept purely as
+# refcount ballast: stock appearances/animators hold our matrix
+# providers and may still evaluate them briefly while native
+# teardown finishes after the entities are destroyed.
+_RETIRED_POSES = []
+
 
 def _pose_for_entity(entity_id):
     """Kinematic pose registered for a battle entity id, or None."""
@@ -2521,14 +2534,46 @@ def _install_account_patch():
     from Account import PlayerAccount
     if getattr(PlayerAccount, '_mpBattlePatched', False):
         return
-    # Battle teardown code (StrategicCamera.disable via
-    # Avatar.__destroyGUI) reads BigWorld.player().positionControl
-    # after the hangar Account has been re-promoted; the Account
-    # class has no such attribute and the AttributeError aborted
-    # __destroyGUI mid-flight, leaving the battle session
-    # half-stopped for the next battle (real-client test #19).
-    if not hasattr(PlayerAccount, 'positionControl'):
-        PlayerAccount.positionControl = None
+    # Battle teardown promotes the hangar Account FIRST; the
+    # demoted Avatar's onBecomeNonPlayer then destroys the
+    # battle GUI while BigWorld.player() already returns the
+    # Account.  Stock teardown code reads PlayerAvatar-only
+    # attributes off player() (positionControl in
+    # StrategicCamera.disable, arena in PostMortemControlMode.
+    # disable, consistentMatrices right after it,
+    # observedVehicleID from hangar effects), and the first
+    # AttributeError aborts Avatar.__destroyGUI - which is
+    # called unwrapped, so everything after it in
+    # onBecomeNonPlayer (session stop, stopVisual loop, ...)
+    # never runs (real-client tests #19-20: half-stopped
+    # session, client later died).  Serve harmless sentinels
+    # for exactly that attribute family.
+    class _DummyEvent(object):
+
+        def __iadd__(self, handler):
+            return self
+
+        def __isub__(self, handler):
+            return self
+
+        def __call__(self, *args, **kwargs):
+            pass
+
+    class _DummyMatrices(object):
+
+        def __init__(self):
+            self.onVehicleMatrixBindingChanged = _DummyEvent()
+
+    _teardown_sentinels = {
+        'arena': None,
+        'positionControl': None,
+        'inputHandler': None,
+        'observedVehicleID': 0,
+        'consistentMatrices': _DummyMatrices(),
+    }
+    for _name, _value in _teardown_sentinels.iteritems():
+        if not hasattr(PlayerAccount, _name):
+            setattr(PlayerAccount, _name, _value)
     orig_become_player = PlayerAccount.onBecomePlayer
 
     def _on_become_player(self):
