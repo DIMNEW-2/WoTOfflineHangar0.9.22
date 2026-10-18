@@ -1289,10 +1289,18 @@ def _install_avatar_patch():
 
     # PlayerAvatar.__onSetOwnVehicleAuxPhysicsData forwards into
     # ownVehicle.filter.syncStabilisedYPR - same unsafe native sync
-    # as syncGunAngles. Scope the filter proxy around the notifier.
-    orig_set_aux = getattr(PlayerAvatar, 'set_ownVehicleAuxPhysicsData',
-                           None)
-    if orig_set_aux is not None:
+    # as syncGunAngles. Scope the filter proxy around the handler.
+    # NOTE: the engine notifier set_ownVehicleAuxPhysicsData only
+    # delegates to the private __onSetOwnVehicleAuxPhysicsData, and
+    # __startVehicleVisual calls the PRIVATE name directly.
+    # Real-client test 2026-10-18 #9 died right after startVisual
+    # returned because only set_... was wrapped and the direct call
+    # reached native syncStabilisedYPR unscoped. Wrap every name
+    # that exists; double-scoping on the delegate path is balanced
+    # append/remove and harmless.
+    _aux_log_count = [0]
+
+    def _make_aux_wrapper(orig_fn):
         def _set_aux_physics(self, prev):
             is_battle = _BATTLE_ACTIVE[0]
             if not is_battle:
@@ -1301,7 +1309,14 @@ def _install_avatar_patch():
                 except AttributeError:
                     is_battle = False
             if not is_battle:
-                return orig_set_aux(self, prev)
+                return orig_fn(self, prev)
+            logged = False
+            if _aux_log_count[0] < 5:
+                _aux_log_count[0] += 1
+                logged = True
+                _log('>> __onSetOwnVehicleAuxPhysicsData '
+                     '(filter proxy scoped)')
+                _diag_flush()
             vehicle = None
             try:
                 import BigWorld
@@ -1312,12 +1327,52 @@ def _install_avatar_patch():
             if vehicle is not None:
                 _FILTER_SCOPED.append(vehicle)
             try:
-                return orig_set_aux(self, prev)
+                return orig_fn(self, prev)
             finally:
                 if vehicle is not None:
                     _remove_scoped(vehicle)
+                if logged:
+                    _log('<< __onSetOwnVehicleAuxPhysicsData')
+                    _diag_flush()
 
-        PlayerAvatar.set_ownVehicleAuxPhysicsData = _set_aux_physics
+        _set_aux_physics._mpAuxWrapped = True
+        _set_aux_physics._mpAuxOrigFunc = getattr(orig_fn, 'im_func',
+                                                  orig_fn)
+        return _set_aux_physics
+
+    _aux_wrapped = []
+    for _aux_name in ('_PlayerAvatar__onSetOwnVehicleAuxPhysicsData',
+                      'set_ownVehicleAuxPhysicsData'):
+        _aux_fn = getattr(PlayerAvatar, _aux_name, None)
+        if _aux_fn is None:
+            _log('aux physics wrap: %s not found' % (_aux_name,))
+            continue
+        if getattr(_aux_fn, '_mpAuxWrapped', False):
+            _aux_wrapped.append(_aux_name)
+            continue
+        _aux_raw = getattr(_aux_fn, 'im_func', _aux_fn)
+        _alias_wrap = None
+        for _done_name in _aux_wrapped:
+            _done_fn = getattr(PlayerAvatar, _done_name, None)
+            if getattr(_done_fn, '_mpAuxOrigFunc', None) is _aux_raw:
+                _alias_wrap = _done_fn
+                break
+        try:
+            if _alias_wrap is not None:
+                setattr(PlayerAvatar, _aux_name,
+                        getattr(_alias_wrap, 'im_func', _alias_wrap))
+                _log('aux physics wrap: %s is alias, reused wrapper'
+                     % (_aux_name,))
+            else:
+                setattr(PlayerAvatar, _aux_name,
+                        _make_aux_wrapper(_aux_fn))
+                _log('aux physics wrap installed: %s' % (_aux_name,))
+            _aux_wrapped.append(_aux_name)
+        except Exception:
+            _log('aux physics wrap FAILED (setattr): %s' % (_aux_name,))
+            traceback.print_exc()
+    if not _aux_wrapped:
+        _log('aux physics wrap FAILED: no aux handler on PlayerAvatar')
 
     PlayerAvatar._mpBattlePatched = True
 
@@ -1551,12 +1606,19 @@ def _diag_wrap(cls, attr_name, label):
         return
 
     def _wrapped(self, *args, **kwargs):
-        _log('>> %s' % (label,))
+        suffix = ''
+        try:
+            entity_id = getattr(self, 'id', None)
+            if isinstance(entity_id, (int, long)):
+                suffix = ' id=%s' % (entity_id,)
+        except Exception:
+            suffix = ''
+        _log('>> %s%s' % (label, suffix))
         _diag_flush()
         try:
             return orig(self, *args, **kwargs)
         finally:
-            _log('<< %s' % (label,))
+            _log('<< %s%s' % (label, suffix))
             _diag_flush()
 
     _wrapped._mpBattleDiag = True
@@ -1598,6 +1660,10 @@ def _install_diag_patches():
                    'Avatar.__onInitStepCompleted')
         _diag_wrap(PlayerAvatar, '_PlayerAvatar__startGUI',
                    'Avatar.__startGUI')
+        _diag_wrap(PlayerAvatar, 'vehicle_onEnterWorld',
+                   'Avatar.vehicle_onEnterWorld')
+        _diag_wrap(PlayerAvatar, '_PlayerAvatar__startVehicleVisual',
+                   'Avatar.__startVehicleVisual')
     except Exception:
         pass
     try:
@@ -1666,6 +1732,7 @@ def _install_diag_patches():
     # in the appearance chain, so breadcrumb its stages.
     try:
         from Vehicle import Vehicle as _DiagVehicle
+        _diag_wrap(_DiagVehicle, 'onEnterWorld', 'Vehicle.onEnterWorld')
         _diag_wrap(_DiagVehicle, 'show', 'Vehicle.show')
         _diag_wrap(_DiagVehicle, 'set_publicStateModifiers',
                    'Vehicle.set_publicStateModifiers')
